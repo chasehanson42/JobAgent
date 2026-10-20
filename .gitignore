@@ -5,3 +5,7 @@ build/*
 __pycache__/
 *.pyc
 .pytest_cache/
+# Personal data written by the web app
+config/user_settings.yaml
+config/my_profile.yaml
+.venv/

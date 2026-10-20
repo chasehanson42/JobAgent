@@ -5,7 +5,7 @@ llm:
   # "ollama" (local, default) or "gemini" (free tier cloud).
   provider: ollama
   temperature: 0.2
-  timeout_seconds: 180
+  timeout_seconds: 600               # local models on a laptop CPU can be slow
   max_retries: 2
 
   ollama:
@@ -35,13 +35,13 @@ scrape:
   #    job_link_selector: "a.job-link"
 
 filters:
-  title_blacklist: ["senior director", "vp ", "intern", "principal staff"]
+  title_blacklist: ["intern"]
   title_keywords_required: []          # empty = no requirement
   company_blacklist: []
   location_allowlist: []               # empty = any location
   location_blacklist: []
   remote_only: false
-  min_salary: 90000                    # annual, in salary currency
+  min_salary: null                     # annual; null = use target.min_salary from the profile
   drop_if_salary_unknown: false
   description_blacklist: ["security clearance required", "ts/sci"]
 

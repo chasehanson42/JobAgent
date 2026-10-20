@@ -1,0 +1,16 @@
+# Only this computer can open the app: profiles and resumes are personal data.
+[server]
+address = "127.0.0.1"
+port = 8501
+maxUploadSize = 10
+headless = true            # launch.py opens the browser; also skips the first-run email prompt
+
+[browser]
+serverAddress = "localhost"
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "light"

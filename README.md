@@ -4,6 +4,26 @@ A local-first, zero-cost job pipeline: scrape listings, filter them with plain
 Python rules, fit-score them with a local or free-tier LLM, and generate a
 tailored ATS resume and cover letter grounded only in your own profile.
 
+## Quick start (no command line)
+
+1. Install **Python 3.11+** from [python.org](https://www.python.org/downloads/).
+   On Windows, tick **"Add python.exe to PATH"** in the installer.
+2. Install **Ollama** from [ollama.com/download](https://ollama.com/download).
+3. Double-click **`Start JobAgent.bat`** (Windows) or **`Start JobAgent.command`** (Mac).
+   The first start takes a few minutes; then JobAgent opens in your browser.
+4. Follow the **Setup** page: download the AI model, upload your resume, check it, save.
+5. **Find jobs** (search job sites or paste a posting), then **Your matches** →
+   **Create resume & cover letter** → download PDF or Word.
+
+Keep the black launcher window open while you use JobAgent; close it to stop.
+On a Mac, the first time macOS may refuse to open the file: right-click it → **Open** → **Open**.
+`HOW TO START.txt` has the same steps in plain text for sharing.
+
+Your profile and settings are saved in `config/my_profile.yaml` and
+`config/user_settings.yaml`, jobs in `data/`, documents in `build/`. None of
+these are committed to git, and the web page only accepts connections from
+this computer.
+
 No paid APIs. The LLM is either **Ollama on localhost** (default) or
 **Google Gemini's free developer tier** through its OpenAI-compatible endpoint.
 HTTP calls use only the Python standard library.
@@ -12,6 +32,9 @@ HTTP calls use only the Python standard library.
 
 ```
 free_job_agent/
+├── Start JobAgent.bat/.command  # double-click launchers (set up .venv, then run launch.py)
+├── launch.py                  # starts Streamlit, waits for it, opens the browser
+├── app.py / webapp.py         # browser UI: Setup, My profile, Find jobs, Your matches
 ├── orchestrator.py            # CLI: scrape | rank | list | generate | check
 ├── config/
 │   ├── settings.yaml          # LLM provider toggle, scrape targets, filters
@@ -21,6 +44,8 @@ free_job_agent/
 │   ├── llm_client.py          # OllamaClient / GeminiFreeTierClient + build_client()
 │   ├── models.py              # Job, FitResult dataclasses
 │   ├── storage.py             # data/*.jsonl, rankings.json, build/<job_id>/
+│   ├── pipeline.py            # scrape/rank/generate steps shared by CLI and web UI
+│   ├── ollama_admin.py        # is Ollama running, which models, pull with progress
 │   └── jsonutil.py            # robust JSON extraction from LLM output
 ├── scrapers/
 │   ├── job_scraper.py         # python-jobspy + optional Playwright career pages
@@ -32,17 +57,18 @@ free_job_agent/
 │   ├── resume_tailor.py       # rewrites bullets from verified profile facts only
 │   ├── cover_letter_writer.py # 3-paragraph letter
 │   └── critic_agent.py        # deterministic + LLM hallucination/format checks
+├── importers/
+│   └── resume_importer.py     # PDF/DOCX/TXT resume -> draft profile (+ what to double-check)
 ├── exporters/
 │   └── pdf_builder.py         # Markdown -> .md / .pdf (ReportLab) / .docx
 ├── data/                      # raw_jobs.jsonl, jobs.jsonl, rankings.json (git-ignored)
 └── build/                     # build/<job_id>/resume.pdf, cover_letter.pdf, ...
 ```
 
-## Setup
+## Command-line setup
 
 ```bash
-cd free_job_agent
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-scraping.txt
 playwright install chromium        # only if you use career_pages
 
 # Option A: local LLM (default)
@@ -89,5 +115,6 @@ python orchestrator.py generate --job-id <ID>      # writes build/<ID>/resume.{m
 ## Tests
 
 ```bash
-python -m pytest -q        # no network or LLM needed; uses fake clients and a stub server
+pip install -r requirements-dev.txt
+python -m pytest -q        # no network or LLM needed; fake LLM, stub Ollama, headless UI test
 ```

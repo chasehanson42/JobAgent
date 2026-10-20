@@ -40,6 +40,8 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str],
         raise LLMError(f"HTTP {exc.code} from {url}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise LLMError(f"Cannot reach {url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise LLMError(f"Request to {url} timed out after {timeout:.0f}s") from exc
 
 
 def _with_retries(fn, retries: int):
@@ -49,6 +51,8 @@ def _with_retries(fn, retries: int):
             return fn()
         except LLMError as exc:
             last = exc
+            if "timed out" in str(exc):
+                raise  # retrying a slow model just multiplies the wait
             if attempt < retries:
                 time.sleep(2 ** attempt)
     raise LLMError(f"LLM call failed after {retries + 1} attempts: {last}")
