@@ -1,5 +1,6 @@
 """Drive the Streamlit app headlessly: setup -> profile import -> add job -> score -> generate."""
 import json
+import threading
 
 import pytest
 import yaml
@@ -10,6 +11,7 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 import core.llm_client
 import core.settings
 from core import ollama_admin
+from core.background import MANAGER
 from core.settings import PROJECT_ROOT
 
 from test_orchestrator_e2e import ScriptedLLM
@@ -75,7 +77,10 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.setattr(ollama_admin, "pull_model", fake_pull)
     llm = AppLLM()
     monkeypatch.setattr(core.llm_client, "build_client", lambda s, provider=None: llm)
-    return tmp_path, llm
+    MANAGER._tasks.clear()
+    yield tmp_path, llm
+    MANAGER.wait()
+    MANAGER._tasks.clear()
 
 
 def _page(name: str) -> AppTest:
@@ -95,13 +100,19 @@ def _button(at, label):
     return next(b for b in at.button if b.label == label)
 
 
+def _finish(at):
+    """Background task started by the last click: wait for it, then refresh the page."""
+    MANAGER.wait()
+    return at.run()
+
+
 def test_full_flow(app_env):
     tmp_path, _ = app_env
 
     # Setup: Ollama "running", model missing -> download it.
     at = _page("setup").run()
     assert not at.exception
-    _button(at, "Download").click().run()
+    _finish(_button(at, "Download").click().run())
     assert not at.exception
     saved = yaml.safe_load((tmp_path / "user_settings.yaml").read_text())
     assert saved["llm"]["ollama"]["model"] == "qwen2.5:7b-instruct"
@@ -110,7 +121,7 @@ def test_full_flow(app_env):
     at = _page("profile").run()
     assert not at.exception
     at.file_uploader[0].upload("resume.txt", RESUME.encode(), "text/plain").run()
-    _button(at, "Read my resume").click().run()
+    _finish(_button(at, "Read my resume").click().run())
     assert not at.exception, at.exception
     assert any("Invented Corp" in w.value for w in at.warning)
     assert at.text_input(key="p2_name").value == "Sam Rivera"
@@ -144,13 +155,50 @@ def test_full_flow(app_env):
 
     # Matches: score, then generate documents.
     at = _page("ranked").run()
-    _button(at, "Score 1 job(s) with AI").click().run()
+    _finish(_button(at, "Score 1 job(s) with AI").click().run())
     assert not at.exception, at.exception
     assert at.metric[0].value == "82"
-    _button(at, "Create resume & cover letter").click().run()
+    _finish(_button(at, "Create resume & cover letter").click().run())
     assert not at.exception, at.exception
     labels = [d.label for d in at.get("download_button")]
     assert labels.count("Download PDF") == 2 and labels.count("Download DOCX") == 2
     build = next((tmp_path / "build").iterdir())
     resume = (build / "resume.md").read_text()
     assert resume.startswith("# Sam Rivera") and "Invented Corp" not in resume
+
+
+def test_task_keeps_running_when_user_clicks_elsewhere(app_env):
+    """Regression: clicking anything used to abort scoring mid-way."""
+    tmp_path, llm = app_env
+    release = threading.Event()
+    real_chat = llm.chat
+
+    def slow_chat(system, user, **kw):
+        release.wait(10)
+        return real_chat(system, user, **kw)
+
+    llm.chat = slow_chat
+    storage_jobs = tmp_path / "data" / "jobs.jsonl"
+    storage_jobs.parent.mkdir(parents=True)
+    storage_jobs.write_text(json.dumps({
+        "id": "job1", "title": "Office Manager", "company": "Smile Clinic", "location": "Denver, CO",
+        "description": "Office manager for scheduling and QuickBooks bookkeeping at a dental clinic."}) + "\n")
+
+    at = _page("ranked").run()
+    _button(at, "Score 1 job(s) with AI").click().run()
+    assert MANAGER.running() is not None
+    assert not any(b.label == "Score 1 job(s) with AI" for b in at.button)   # progress shown instead
+
+    # Click around: toggle a switch and open other pages while the AI is busy.
+    at.toggle[0].set_value(True).run()
+    other = _page("find").run()
+    assert not other.exception
+    assert _button(other, "Save and search").disabled                       # one AI task at a time
+    assert MANAGER.running() is not None
+
+    release.set()
+    _finish(at)
+    assert not at.exception, at.exception
+    assert MANAGER.get("rank").status == "done"
+    assert json.loads((tmp_path / "data" / "rankings.json").read_text())[0]["fit_score"] == 82
+    assert at.metric[0].value == "82"

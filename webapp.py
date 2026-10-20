@@ -9,7 +9,7 @@ from typing import Any
 import streamlit as st
 
 from core import llm_client, ollama_admin, pipeline
-from core.llm_client import LLMError
+from core.background import MANAGER, Task, TaskBusy
 from core.settings import (has_user_profile, load_profile, load_settings, load_user_overrides,
                            save_profile, save_user_overrides)
 from core.storage import Storage
@@ -67,6 +67,72 @@ def setup_complete(s: dict[str, Any]) -> bool:
     return has_user_profile(s) and ollama_admin.has_model(base, model)
 
 
+# ---------------------------------------------------------------- background tasks
+
+def start_task(key: str, label: str, fn) -> None:
+    """Start fn(task) in the background, then refresh so its progress shows."""
+    try:
+        MANAGER.start(key, label, fn)
+    except TaskBusy as exc:
+        st.warning(str(exc))
+        return
+    st.rerun()
+
+
+def busy_reason() -> str | None:
+    t = MANAGER.running()
+    return f"Waiting for “{t.label}” to finish" if t else None
+
+
+def _elapsed(t: Task) -> str:
+    import time
+    secs = int((t.finished or time.time()) - t.started)
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+def _refresh_when_finished(t: Task) -> None:
+    """Re-run the whole page once after a task ends, so its results appear."""
+    seen = st.session_state.setdefault("seen_tasks", set())
+    if not t.running and t.id not in seen:
+        seen.add(t.id)
+        st.rerun()
+
+
+@st.fragment(run_every=1.5)
+def task_progress(key: str) -> None:
+    """Live progress for one task; refreshes itself without re-running the page."""
+    t = MANAGER.get(key)
+    if t is None:
+        return
+    if t.running:
+        st.progress(t.progress or 0.0, text=f"{t.message or t.label} · {_elapsed(t)}")
+        st.caption("You can keep using JobAgent while this runs. It stops only if you close "
+                   "the black JobAgent window.")
+    _refresh_when_finished(t)
+
+
+@st.fragment(run_every=2)
+def sidebar_status() -> None:
+    """Shown on every page, so a running task is never 'lost' after navigating away."""
+    t = MANAGER.latest()
+    if t is None:
+        return
+    if t.running:
+        st.info(f"⏳ **{t.label}**  \n{t.message or 'Working...'}")
+        st.progress(t.progress or 0.0, text=_elapsed(t))
+    elif t.status == "done":
+        st.success(f"✅ Finished: {t.label}")
+    else:
+        st.error(f"Couldn't finish: {t.label}")
+    _refresh_when_finished(t)
+
+
+def task_error(key: str) -> None:
+    t = MANAGER.get(key)
+    if t is not None and t.status == "error":
+        show_error(t.error)
+
+
 # ---------------------------------------------------------------- setup
 
 def page_setup() -> None:
@@ -106,21 +172,13 @@ def page_setup() -> None:
                           format_func=lambda m: f"{m} ({MODEL_SIZES.get(m, '?')} download)"
                           + ("  · recommended" if m == recommended else ""))
         st.caption("This is a one-time download. It can take 5–30 minutes depending on your internet.")
-        if st.button("Download", type="primary", disabled=not running):
-            bar = st.progress(0.0, text="Starting download...")
-            try:
-                for ev in ollama_admin.pull_model(base, choice):
-                    done, total = ev.get("completed"), ev.get("total")
-                    if done and total:
-                        bar.progress(min(done / total, 1.0),
-                                     text=f"{ev['status']} · {done / 1e9:.1f} of {total / 1e9:.1f} GB")
-                    else:
-                        bar.progress(0.0 if ev.get("status") != "success" else 1.0, text=ev.get("status", ""))
-                save_user_overrides({"llm": {"provider": "ollama", "ollama": {"model": choice}}})
-                st.success("Model downloaded.")
-                st.rerun()
-            except Exception as exc:  # noqa: BLE001 - show any failure to the user
-                show_error(exc)
+        pulling = MANAGER.get("pull")
+        if pulling and pulling.running:
+            task_progress("pull")
+        elif st.button("Download", type="primary", disabled=not running or bool(busy_reason()),
+                       help=busy_reason()):
+            start_task("pull", f"Downloading {choice}", lambda t: _pull(t, base, choice))
+        task_error("pull")
 
     if running:
         others = [m for m in ollama_admin.list_models(base) if m != model]
@@ -139,7 +197,22 @@ def page_setup() -> None:
     st.page_link(PAGES["profile"], label="Go to My profile", icon="👤")
 
 
+def _pull(task: Task, base: str, model: str) -> None:
+    for ev in ollama_admin.pull_model(base, model):
+        done, total = ev.get("completed"), ev.get("total")
+        if done and total:
+            task.update(done / total, f"{ev['status']} · {done / 1e9:.1f} of {total / 1e9:.1f} GB")
+        else:
+            task.update(None, ev.get("status", ""))
+    save_user_overrides({"llm": {"provider": "ollama", "ollama": {"model": model}}})
+
+
 # ---------------------------------------------------------------- profile
+
+def _read_resume(task: Task, client, text: str) -> tuple[dict[str, Any], list[str]]:
+    task.update(None, "Reading your resume. This can take a minute or two...")
+    return draft_profile(client, text)
+
 
 def _load_draft(profile: dict[str, Any], warnings: list[str] | None = None) -> None:
     st.session_state.draft = profile
@@ -156,18 +229,26 @@ def page_profile() -> None:
     st.write("JobAgent only uses what's on this page. It rewords and highlights your real "
              "experience for each job, but never invents anything.")
 
+    reading = MANAGER.get("resume")
+    if reading and reading.status == "done" and st.session_state.get("resume_loaded") != reading.id:
+        st.session_state.resume_loaded = reading.id
+        _load_draft(*reading.result)
+
     with st.container(border=True):
         st.subheader("Fill this in from your resume")
         up = st.file_uploader("Your current resume (PDF, Word or text)", type=["pdf", "docx", "txt", "md"])
-        if up is not None and st.button("Read my resume", type="primary"):
+        if reading and reading.running:
+            task_progress("resume")
+        elif up is not None and st.button("Read my resume", type="primary", disabled=bool(busy_reason()),
+                                          help=busy_reason()):
             try:
                 text = extract_text(up.name, up.getvalue())
-                with st.spinner("Reading your resume. This can take a minute or two..."):
-                    profile, warnings = draft_profile(build_client(s), text)
-                _load_draft(profile, warnings)
-                st.rerun()
-            except (LLMError, ResumeImportError) as exc:
+            except ResumeImportError as exc:
                 show_error(exc)
+            else:
+                client = build_client(s)
+                start_task("resume", "Reading your resume", lambda t: _read_resume(t, client, text))
+        task_error("resume")
 
     if st.session_state.import_warnings:
         st.warning("**Please double-check these before saving:**\n\n"
@@ -313,7 +394,7 @@ def page_find() -> None:
             company_bl = st.text_area("Skip these companies, one per line",
                                       "\n".join(f.get("company_blacklist", [])))
 
-        if st.button("Save and search", type="primary"):
+        if st.button("Save and search", type="primary", disabled=bool(busy_reason()), help=busy_reason()):
             save_user_overrides({
                 "scrape": {"search_terms": lines(terms), "locations": lines(locs), "sites": sites,
                            "results_wanted": per_search, "hours_old": days * 24},
@@ -326,11 +407,14 @@ def page_find() -> None:
             elif not lines(terms) or not sites:
                 st.error("Enter at least one job title and pick at least one job site.")
             else:
-                with st.spinner("Searching job sites. This usually takes 1–5 minutes..."):
-                    try:
-                        _show_scrape_summary(pipeline.scrape(load_settings(), storage))
-                    except Exception as exc:  # noqa: BLE001
-                        show_error(exc)
+                fresh = load_settings()
+                start_task("scrape", "Searching job sites", lambda t: _search(t, fresh))
+        searching = MANAGER.get("scrape")
+        if searching and searching.running:
+            task_progress("scrape")
+        elif searching and searching.status == "done":
+            _show_scrape_summary(searching.result)
+        task_error("scrape")
 
     with st.container(border=True):
         st.subheader("Found a job yourself? Paste it here")
@@ -357,6 +441,11 @@ def page_find() -> None:
                 for p in (storage.jobs_path, storage.rankings_path, storage.raw_jobs_path):
                     p.unlink(missing_ok=True)
                 st.rerun()
+
+
+def _search(task: Task, settings: dict[str, Any]) -> pipeline.ScrapeSummary:
+    task.update(None, "Searching job sites. This usually takes 1–5 minutes...")
+    return pipeline.scrape(settings, Storage(settings))
 
 
 def _show_scrape_summary(sm: pipeline.ScrapeSummary) -> None:
@@ -391,14 +480,16 @@ def page_ranked() -> None:
         n = min(len(waiting), per_run)
         st.write(f"**{len(waiting)}** job(s) haven't been scored yet. The AI takes roughly "
                  "20–60 seconds per job on a laptop.")
-        if st.button(f"Score {n} job(s) with AI", type="primary"):
-            bar = st.progress(0.0, text="Starting...")
-            try:
-                pipeline.rank(s, storage, build_client(s), progress=lambda i, n, label: bar.progress(
-                    (i - 1) / n, text=f"Scoring {i} of {n}: {label}"))
-                st.rerun()
-            except Exception as exc:  # noqa: BLE001
-                show_error(exc)
+        scoring = MANAGER.get("rank")
+        if scoring and scoring.running:
+            task_progress("rank")
+        elif st.button(f"Score {n} job(s) with AI", type="primary", disabled=bool(busy_reason()),
+                       help=busy_reason()):
+            client = build_client(s)
+            start_task("rank", f"Scoring {n} job(s)", lambda t: pipeline.rank(
+                s, storage, client, progress=lambda i, n, label: t.update(
+                    (i - 1) / n, f"Scoring {i} of {n}: {label}")))
+    task_error("rank")
 
     show_skip = st.toggle("Also show jobs the AI suggests skipping")
     rows = pipeline.ranked_rows(storage, include_skip=show_skip)
@@ -425,17 +516,20 @@ def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
             st.markdown("➖ **They also want:** " + ", ".join(fit.skill_gaps))
 
         out_dir = storage.build_dir / job.id
+        key = f"generate:{job.id}"
+        writing = MANAGER.get(key)
         label = "Create again" if (out_dir / "resume.pdf").exists() else "Create resume & cover letter"
-        if st.button(label, key=f"gen_{job.id}", type="primary" if fit.recommendation == "Apply" else "secondary"):
-            with st.status("Writing your documents. This can take a few minutes...", expanded=True) as status:
-                try:
-                    pipeline.generate(s, storage, build_client(s), job.id, force=True,
-                                      progress=lambda i, n, what: st.write(f"Writing the {what} and checking it..."))
-                    status.update(label="Done!", state="complete")
-                except Exception as exc:  # noqa: BLE001
-                    status.update(label="Couldn't finish", state="error")
-                    show_error(exc)
-        _downloads(out_dir)
+        if writing and writing.running:
+            task_progress(key)
+        elif st.button(label, key=f"gen_{job.id}", type="primary" if fit.recommendation == "Apply" else "secondary",
+                       disabled=bool(busy_reason()), help=busy_reason()):
+            client = build_client(s)
+            start_task(key, f"Writing documents for {job.title} at {job.company}", lambda t: pipeline.generate(
+                s, storage, client, job.id, force=True,
+                progress=lambda i, n, what: t.update((i - 1) / n, f"Writing the {what} and checking it...")))
+        task_error(key)
+        if not (writing and writing.running):
+            _downloads(out_dir)
 
 
 def _downloads(out_dir: Path) -> None:
