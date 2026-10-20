@@ -1,0 +1,60 @@
+# FreeJobAgent runtime settings. Every backend here is free: a local Ollama
+# server, or Google Gemini's free developer tier (OpenAI-compatible endpoint).
+
+llm:
+  # "ollama" (local, default) or "gemini" (free tier cloud).
+  provider: ollama
+  temperature: 0.2
+  timeout_seconds: 180
+  max_retries: 2
+
+  ollama:
+    base_url: http://localhost:11434
+    model: qwen2.5:7b-instruct      # alternatives: llama3.1:8b, mistral:7b
+    num_ctx: 8192
+
+  gemini:
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    model: gemini-2.0-flash
+    # The key is read from this environment variable; never commit it here.
+    api_key_env: GEMINI_API_KEY
+    # Free tier is rate limited; stay under it.
+    min_seconds_between_calls: 4.5
+
+scrape:
+  search_terms: ["python developer", "backend engineer"]
+  locations: ["Remote", "Austin, TX"]
+  # python-jobspy site names: indeed, linkedin, glassdoor, zip_recruiter, google
+  sites: [indeed, linkedin, google]
+  results_wanted: 30
+  hours_old: 72
+  # Direct company career pages scraped with Playwright (optional).
+  career_pages: []
+  #  - url: https://example.com/careers
+  #    company: Example Corp
+  #    job_link_selector: "a.job-link"
+
+filters:
+  title_blacklist: ["senior director", "vp ", "intern", "principal staff"]
+  title_keywords_required: []          # empty = no requirement
+  company_blacklist: []
+  location_allowlist: []               # empty = any location
+  location_blacklist: []
+  remote_only: false
+  min_salary: 90000                    # annual, in salary currency
+  drop_if_salary_unknown: false
+  description_blacklist: ["security clearance required", "ts/sci"]
+
+ranking:
+  min_fit_score: 65                    # below this, recommendation is forced to Skip
+  max_jobs_per_run: 25                 # cap LLM calls per `rank`
+  max_description_chars: 12000
+
+generation:
+  critic_max_rounds: 2
+  export_formats: [md, pdf, docx]
+
+paths:
+  data_dir: data
+  build_dir: build
+  candidate_profile: config/candidate_profile.yaml

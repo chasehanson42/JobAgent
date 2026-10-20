@@ -1,0 +1,52 @@
+# Master profile. This is the ONLY source of truth for generated documents:
+# the generators may rephrase and reorder these facts but never add new ones.
+name: Jane Doe
+email: jane.doe@example.com
+phone: "+1 555 010 0000"
+location: Austin, TX
+links:
+  - https://github.com/janedoe
+  - https://linkedin.com/in/janedoe
+headline: Backend engineer focused on Python data services
+summary: >
+  Backend engineer with 6 years building Python APIs and data pipelines.
+  Comfortable owning services end to end, from schema design to on-call.
+
+target:
+  titles: ["Backend Engineer", "Python Developer", "Data Engineer"]
+  min_salary: 110000
+  remote_ok: true
+
+skills:
+  languages: [Python, SQL, Go, Bash]
+  frameworks: [FastAPI, Django, Pandas, Airflow]
+  infrastructure: [PostgreSQL, Redis, Docker, Kubernetes, AWS, Terraform]
+  practices: [CI/CD, TDD, Observability, Code review]
+
+experience:
+  - company: Acme Analytics
+    title: Senior Backend Engineer
+    location: Remote
+    start: 2022-03
+    end: present
+    bullets:
+      - Designed a FastAPI ingestion service handling 40M events/day on PostgreSQL and Redis.
+      - Cut p95 API latency from 900ms to 180ms by adding query indexes and response caching.
+      - Led migration of 12 cron jobs to Airflow, reducing failed nightly runs by 70%.
+  - company: Widget Co
+    title: Software Engineer
+    location: Austin, TX
+    start: 2019-06
+    end: 2022-02
+    bullets:
+      - Built Django REST endpoints used by 3 internal teams.
+      - Containerized legacy services with Docker and deployed them to Kubernetes on AWS.
+      - Wrote Terraform modules for staging environments, cutting setup time from days to an hour.
+
+education:
+  - school: University of Texas at Austin
+    degree: B.S. Computer Science
+    year: 2019
+
+certifications:
+  - AWS Certified Developer – Associate (2021)
