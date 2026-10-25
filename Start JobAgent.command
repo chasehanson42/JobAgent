@@ -48,6 +48,8 @@ fi
 
 if ! curl -s -m 2 http://localhost:11434/api/version >/dev/null 2>&1 && [ -d /Applications/Ollama.app ]; then
   echo "  Starting Ollama..."
+  # Let Ollama score two jobs at once (matches parallel.llm_workers in settings).
+  launchctl setenv OLLAMA_NUM_PARALLEL "${OLLAMA_NUM_PARALLEL:-2}"
   open -a Ollama
 fi
 

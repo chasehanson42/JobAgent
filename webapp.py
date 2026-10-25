@@ -1,7 +1,6 @@
 """Pages of the JobAgent web app. app.py is the entry point that wires them together."""
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -13,6 +12,7 @@ from core.background import MANAGER, Task, TaskBusy
 from core.settings import (has_user_profile, load_profile, load_settings, load_user_overrides,
                            save_profile, save_user_overrides)
 from core.storage import Storage
+from scrapers.job_scraper import jobspy_available
 from importers.resume_importer import (ResumeImportError, draft_profile, empty_profile,
                                        extract_text, validate_profile)
 
@@ -52,6 +52,11 @@ def show_error(exc: Exception) -> None:
     if not isinstance(exc, (pipeline.PipelineError, ResumeImportError)):
         with st.expander("Technical details (for whoever set this up)"):
             st.code(f"{type(exc).__name__}: {exc}")
+
+
+def _md(text: str) -> str:
+    """Escape Markdown in text that came from a job posting or the AI."""
+    return "".join("\\" + ch if ch in "\\`*_[]<>#|~$" else ch for ch in str(text))
 
 
 def lines(text: str) -> list[str]:
@@ -394,27 +399,26 @@ def page_find() -> None:
             company_bl = st.text_area("Skip these companies, one per line",
                                       "\n".join(f.get("company_blacklist", [])))
 
-        if st.button("Save and search", type="primary", disabled=bool(busy_reason()), help=busy_reason()):
+        st.caption("JobAgent searches every site at the same time, skips jobs that don't mention your "
+                   "titles or skills, and has the AI score the best ones first. Matches appear on "
+                   "**Your matches** as soon as each one is scored.")
+        if st.button("Search and rank", type="primary", disabled=bool(busy_reason()), help=busy_reason()):
             save_user_overrides({
                 "scrape": {"search_terms": lines(terms), "locations": lines(locs), "sites": sites,
                            "results_wanted": per_search, "hours_old": days * 24},
                 "filters": {"min_salary": int(min_salary) or None, "remote_only": remote_only,
                             "title_blacklist": lines(title_bl), "company_blacklist": lines(company_bl)},
             })
-            if importlib.util.find_spec("jobspy") is None:
+            if not jobspy_available():
                 st.error("The job-site search add-on isn't installed. Close JobAgent and start it again "
                          "with the Start launcher; it will try to install it. You can still paste jobs below.")
             elif not lines(terms) or not sites:
                 st.error("Enter at least one job title and pick at least one job site.")
             else:
                 fresh = load_settings()
-                start_task("scrape", "Searching job sites", lambda t: _search(t, fresh))
-        searching = MANAGER.get("scrape")
-        if searching and searching.running:
-            task_progress("scrape")
-        elif searching and searching.status == "done":
-            _show_scrape_summary(searching.result)
-        task_error("scrape")
+                client = build_client(fresh)
+                start_task("hunt", "Searching and ranking jobs", lambda t: _hunt(t, fresh, client))
+        _hunt_status(search=True)
 
     with st.container(border=True):
         st.subheader("Found a job yourself? Paste it here")
@@ -425,16 +429,20 @@ def page_find() -> None:
             location = c1.text_input("Location")
             url = c2.text_input("Link to the posting")
             desc = st.text_area("Full job description", height=200)
-            if st.form_submit_button("Add job"):
+            if st.form_submit_button("Add and score", disabled=bool(busy_reason())):
                 if not (title and company and desc):
                     st.error("Please fill in the title, company and description.")
                 else:
                     row = {"title": title, "company": company, "location": location, "url": url,
                            "description": desc, "is_remote": "remote" in location.lower() or None}
-                    _show_scrape_summary(pipeline.scrape(s, storage, pipeline.jobs_from_rows([row], "manual")))
+                    client = build_client(s)
+                    pasted = pipeline.jobs_from_rows([row], "manual")
+                    start_task("hunt", f"Scoring {title} at {company}",
+                               lambda t: _hunt(t, s, client, new_jobs=pasted, search=False))
+        _hunt_status(search=False)
 
     if storage.load_jobs():
-        st.page_link(PAGES["ranked"], label="Next: score your jobs", icon="⭐")
+        st.page_link(PAGES["ranked"], label="See your matches", icon="⭐")
     with st.expander("Start over"):
         if st.checkbox("Yes, delete all saved jobs and scores (your resumes in build/ are kept)"):
             if st.button("Delete saved jobs"):
@@ -443,23 +451,73 @@ def page_find() -> None:
                 st.rerun()
 
 
-def _search(task: Task, settings: dict[str, Any]) -> pipeline.ScrapeSummary:
-    task.update(None, "Searching job sites. This usually takes 1–5 minutes...")
-    return pipeline.scrape(settings, Storage(settings))
+def _hunt(task: Task, settings: dict[str, Any], client, *, new_jobs=None, search: bool = True):
+    return pipeline.hunt(settings, Storage(settings), client, new_jobs=new_jobs, search=search,
+                         on_progress=lambda p: task.update(p.fraction, p.message))
 
 
-def _show_scrape_summary(sm: pipeline.ScrapeSummary) -> None:
-    if sm.scraped == 0:
-        st.warning("No jobs came back. Try broader titles, more locations, or more days.")
+def _hunt_status(search: bool) -> None:
+    """Progress or result of the last hunt, shown under the control that started it."""
+    t = MANAGER.get("hunt")
+    if t is None or (t.label == "Searching and ranking jobs") != search:
         return
-    st.success(f"Found {sm.scraped} job(s): kept **{sm.kept}**, filtered out {len(sm.dropped)}.")
+    if t.running:
+        task_progress("hunt")
+    elif t.status == "done":
+        _show_hunt_summary(t.result, t)
+    task_error("hunt")
+
+
+REASONS = {
+    "not_relevant_to_profile": "doesn't mention your job titles or skills",
+    "description_too_short": "posting has almost no description",
+    "empty_title": "posting has no title",
+    "not_remote": "not remote",
+    "location_not_allowed": "outside your locations",
+    "salary_unknown": "no salary listed",
+    "title_missing_required_keyword": "title is missing a required word",
+}
+
+
+def _reason_text(reason: str) -> str:
+    key, _, detail = reason.partition(":")
+    if key == "salary_below_min":
+        return "pays below your minimum"
+    if key.endswith("_blacklist"):
+        return f"{key.split('_')[0]} contains “{detail}”"
+    return REASONS.get(reason, reason.replace("_", " "))
+
+
+def _show_hunt_summary(sm, task: Task) -> None:
+    p = sm.progress
+    if p.queries_total and p.found == 0:
+        st.warning("No jobs came back. Try broader titles, more locations, or more days.")
+    else:
+        took = _elapsed(task)
+        lines_ = []
+        if p.queries_total:
+            lines_.append(f"Searched **{p.queries_total}** time(s) across your sites in {took}: "
+                          f"**{p.found}** listings found.")
+        removed = p.filtered + p.not_relevant
+        if removed:
+            lines_.append(f"Skipped **{removed}** that didn't fit your filters or profile.")
+        lines_.append(f"The AI scored **{p.scored}** job(s): **{p.apply}** good match(es).")
+        st.success("  \n".join(lines_))
+        if p.apply:
+            st.page_link(PAGES["ranked"], label="See your matches", icon="⭐")
+    if sm.unscored_left:
+        st.info(f"{sm.unscored_left} more relevant job(s) are waiting. Score them on **Your matches**.")
+    if p.failed_queries:
+        st.warning("Some searches didn't work (the site may be busy or blocking searches): "
+                   + "; ".join(p.failed_queries[:5]))
     if sm.injection_flagged:
         st.info(f"{sm.injection_flagged} posting(s) contained hidden text trying to manipulate the AI. "
                 "It was removed.")
     if sm.dropped:
-        with st.expander("Why some jobs were filtered out"):
-            for job, reasons in sm.dropped:
-                st.write(f"- **{job.title}** at {job.company}: {', '.join(reasons)}")
+        with st.expander(f"Why {len(sm.dropped)} job(s) were skipped"):
+            for job, reasons in sm.dropped[:100]:
+                st.markdown(f"- **{_md(job.title)}** at {_md(job.company)}: "
+                            + _md(", ".join(_reason_text(r) for r in reasons)))
 
 
 # ---------------------------------------------------------------- ranked
@@ -474,46 +532,58 @@ def page_ranked() -> None:
         st.page_link(PAGES["find"], label="Find jobs", icon="🔎")
         return
 
+    live = next((t for t in (MANAGER.get("hunt"), MANAGER.get("rank")) if t and t.running), None)
     waiting = pipeline.unranked_jobs(storage)
-    per_run = int(s.get("ranking", {}).get("max_jobs_per_run", 25))
-    if waiting:
+    per_run = int(s.get("ranking", {}).get("max_jobs_per_run", 30))
+    if live:
+        task_progress("hunt" if live is MANAGER.get("hunt") else "rank")
+    elif waiting:
         n = min(len(waiting), per_run)
-        st.write(f"**{len(waiting)}** job(s) haven't been scored yet. The AI takes roughly "
-                 "20–60 seconds per job on a laptop.")
-        scoring = MANAGER.get("rank")
-        if scoring and scoring.running:
-            task_progress("rank")
-        elif st.button(f"Score {n} job(s) with AI", type="primary", disabled=bool(busy_reason()),
-                       help=busy_reason()):
+        st.write(f"**{len(waiting)}** job(s) haven't been scored yet.")
+        if st.button(f"Score {n} job(s) with AI", type="primary", disabled=bool(busy_reason()),
+                     help=busy_reason()):
             client = build_client(s)
-            start_task("rank", f"Scoring {n} job(s)", lambda t: pipeline.rank(
-                s, storage, client, progress=lambda i, n, label: t.update(
-                    (i - 1) / n, f"Scoring {i} of {n}: {label}")))
+            start_task("rank", f"Scoring {n} job(s)", lambda t: _hunt(t, s, client, search=False))
     task_error("rank")
 
     show_skip = st.toggle("Also show jobs the AI suggests skipping")
+    if live:
+        _live_match_list(show_skip)       # refreshes itself as each job is scored
+    else:
+        _match_list(s, storage, show_skip)
+
+
+def _match_list(s: dict[str, Any], storage: Storage, show_skip: bool) -> None:
     rows = pipeline.ranked_rows(storage, include_skip=show_skip)
     if not rows:
         st.info("No recommended jobs yet." + ("" if show_skip else " Turn on the switch above to see all scores."))
     for fit, job in rows:
-        if job is None:
-            continue
-        _job_card(s, storage, fit, job)
+        if job is not None:
+            _job_card(s, storage, fit, job)
+
+
+@st.fragment(run_every=3)
+def _live_match_list(show_skip: bool) -> None:
+    s = load_settings()
+    _match_list(s, Storage(s), show_skip)
 
 
 def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
     with st.container(border=True):
         c1, c2 = st.columns([1, 5])
         c1.metric("Fit", fit.fit_score)
-        c2.markdown(f"**{job.title}**  \n{job.company} · {job.location or 'Location not listed'}")
+        c2.markdown(f"**{_md(job.title)}**  \n{_md(job.company)} · {_md(job.location) or 'Location not listed'}")
         if job.url:
-            c2.markdown(f"[Open the posting]({job.url})")
+            c2.markdown(f"[Open the posting]({job.url.replace('(', '%28').replace(')', '%29')})")
         if fit.rationale:
-            st.caption(fit.rationale)
-        if fit.matched_skills:
-            st.markdown("✅ **You have:** " + ", ".join(fit.matched_skills))
+            st.caption(_md(fit.rationale))
+        if fit.fit_highlights:
+            st.markdown("**Why you fit**  \n" + "  \n".join(
+                f"✅ **{_md(h['requirement'])}**: {_md(h['evidence'])}" for h in fit.fit_highlights))
+        elif fit.matched_skills:
+            st.markdown("✅ **You have:** " + ", ".join(_md(x) for x in fit.matched_skills))
         if fit.skill_gaps:
-            st.markdown("➖ **They also want:** " + ", ".join(fit.skill_gaps))
+            st.markdown("➖ **They also want:** " + ", ".join(_md(x) for x in fit.skill_gaps))
 
         out_dir = storage.build_dir / job.id
         key = f"generate:{job.id}"

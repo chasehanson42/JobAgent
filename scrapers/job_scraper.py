@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlsplit
@@ -216,60 +217,94 @@ def _dataframe_rows(df: Any) -> list[dict[str, Any]]:
     return []
 
 
+@dataclass(frozen=True)
+class SearchQuery:
+    """One job-board search: a single site, title and location.
+
+    Queries are the unit of work for the parallel search agents
+    (core.agents); queries for the same site run one after another.
+    """
+    site: str
+    term: str
+    location: str = ""
+    results_wanted: int = 20
+    hours_old: int | None = None
+
+    @property
+    def label(self) -> str:
+        where = f" in {self.location}" if self.location else ""
+        return f"{self.site.replace('_', ' ').title()}: {self.term}{where}"
+
+
+def build_queries(cfg: dict[str, Any]) -> list[SearchQuery]:
+    terms = [str(t) for t in _as_list(cfg.get("search_terms")) if str(t).strip()]
+    locations = [str(loc) for loc in _as_list(cfg.get("locations")) if str(loc).strip()] or [""]
+    sites = [str(s) for s in _as_list(cfg.get("sites")) if str(s).strip()]
+    results_wanted = int(cfg.get("results_wanted") or 20)
+    hours_old = int(cfg["hours_old"]) if cfg.get("hours_old") else None
+    return [SearchQuery(site, term, location, results_wanted, hours_old)
+            for site in sites for term in terms for location in locations]
+
+
+def jobspy_available() -> bool:
+    try:
+        import jobspy  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def run_query(query: SearchQuery) -> list[Job]:
+    """Run one job-board search. Raises on failure; callers decide how to continue."""
+    from jobspy import scrape_jobs as jobspy_scrape  # type: ignore[import-not-found]
+
+    kwargs: dict[str, Any] = {
+        "site_name": [query.site],
+        "search_term": query.term,
+        "results_wanted": query.results_wanted,
+    }
+    if query.location:
+        kwargs["location"] = query.location
+        if query.location.strip().lower() == "remote":
+            kwargs["is_remote"] = True
+    if query.hours_old:
+        kwargs["hours_old"] = query.hours_old
+    if query.site == "google":
+        kwargs["google_search_term"] = (
+            f"{query.term} jobs near {query.location}" if query.location else f"{query.term} jobs")
+    df = jobspy_scrape(**kwargs)
+    scraped_at = _now_iso()
+    jobs: list[Job] = []
+    for row in _dataframe_rows(df):
+        try:
+            job = _row_to_job(row, scraped_at)
+        except Exception as exc:
+            log.warning("Skipping malformed jobspy row: %s", exc)
+            continue
+        if job:
+            jobs.append(job)
+    log.info("jobspy: %d jobs for %s", len(jobs), query.label)
+    return jobs
+
+
 def _scrape_jobspy(cfg: dict[str, Any]) -> list[Job]:
-    terms = [str(t) for t in _as_list(cfg.get("search_terms"))]
-    locations = [str(loc) for loc in _as_list(cfg.get("locations"))] or [""]
-    sites = [str(s) for s in _as_list(cfg.get("sites"))]
-    if not terms or not sites:
+    """Sequential search (CLI `scrape`). The web app uses core.agents instead."""
+    queries = build_queries(cfg)
+    if not queries:
         log.info("No search_terms or sites configured; skipping job boards.")
         return []
-    try:
-        from jobspy import scrape_jobs as jobspy_scrape  # type: ignore[import-not-found]
-    except ImportError:
+    if not jobspy_available():
         log.warning("python-jobspy is not installed; skipping job boards. "
                     "Install it with: pip install python-jobspy")
         return []
-
-    results_wanted = int(cfg.get("results_wanted") or 20)
-    hours_old = cfg.get("hours_old")
     jobs: list[Job] = []
-    first = True
-    for term in terms:
-        for location in locations:
-            if not first:
-                time.sleep(JOBSPY_DELAY_SECONDS)
-            first = False
-            kwargs: dict[str, Any] = {
-                "site_name": sites,
-                "search_term": term,
-                "results_wanted": results_wanted,
-            }
-            if location:
-                kwargs["location"] = location
-                if location.strip().lower() == "remote":
-                    kwargs["is_remote"] = True
-            if hours_old:
-                kwargs["hours_old"] = int(hours_old)
-            if "google" in sites:
-                kwargs["google_search_term"] = (
-                    f"{term} jobs near {location}" if location else f"{term} jobs")
-            try:
-                df = jobspy_scrape(**kwargs)
-            except Exception as exc:  # one failing board must not kill the run
-                log.warning("jobspy query failed (term=%r, location=%r): %s", term, location, exc)
-                continue
-            scraped_at = _now_iso()
-            count = 0
-            for row in _dataframe_rows(df):
-                try:
-                    job = _row_to_job(row, scraped_at)
-                except Exception as exc:
-                    log.warning("Skipping malformed jobspy row: %s", exc)
-                    continue
-                if job:
-                    jobs.append(job)
-                    count += 1
-            log.info("jobspy: %d jobs for term=%r location=%r", count, term, location)
+    for i, query in enumerate(queries):
+        if i:
+            time.sleep(JOBSPY_DELAY_SECONDS)
+        try:
+            jobs.extend(run_query(query))
+        except Exception as exc:  # one failing board must not kill the run
+            log.warning("jobspy query failed (%s): %s", query.label, exc)
     return jobs
 
 

@@ -92,25 +92,41 @@ def unranked_jobs(storage: Storage, rescore: bool = False) -> list[Job]:
 def rank(settings: dict[str, Any], storage: Storage, client: LLMClient, *,
          limit: int | None = None, rescore: bool = False,
          progress: Progress | None = None) -> list[FitResult]:
-    """Score unranked jobs; returns the newly scored results."""
-    from matching.fit_evaluator import FitEvaluator
+    """Score stored jobs that have no score yet (parallel scoring agents); returns new results."""
+    from core.agents import HuntPipeline
 
     if not storage.load_jobs():
         raise PipelineError("No jobs found yet. Search for jobs first.")
-    ranking_cfg = settings.get("ranking", {})
-    todo = unranked_jobs(storage, rescore)[:limit or int(ranking_cfg.get("max_jobs_per_run", 25))]
-    if not todo:
+    if not unranked_jobs(storage, rescore):
         return []
+    hunt_ = HuntPipeline(settings, storage, client, on_progress=_progress_adapter(progress))
+    if limit:
+        hunt_.budget = limit
+    return hunt_.run(score_stored=True, rescore=rescore).results
 
-    evaluator = FitEvaluator(client, load_profile(settings),
-                             min_fit_score=int(ranking_cfg.get("min_fit_score", 65)),
-                             max_description_chars=int(ranking_cfg.get("max_description_chars", 12000)))
-    cb = (lambda i, n, job: progress(i, n, f"{job.title} @ {job.company}")) if progress else None
-    results = evaluator.evaluate_many(todo, progress=cb)
-    merged = {r.job_id: r for r in storage.load_rankings()}
-    merged.update({r.job_id: r for r in results})
-    storage.save_rankings(list(merged.values()))
-    return results
+
+def hunt(settings: dict[str, Any], storage: Storage, client: LLMClient | None, *,
+         new_jobs: list[Job] | None = None, search: bool = True,
+         on_progress: Callable[[Any], None] | None = None):
+    """Search the job sites and score what fits, all in parallel. Returns a HuntSummary."""
+    from core.agents import HuntPipeline
+    from scrapers.job_scraper import build_queries
+
+    queries = build_queries(settings.get("scrape", {})) if search else []
+    return HuntPipeline(settings, storage, client, on_progress=on_progress).run(queries, new_jobs or [])
+
+
+def _progress_adapter(progress: Progress | None):
+    """Map agent progress onto the simple (done, total, label) callback the CLI uses."""
+    if progress is None:
+        return None
+    last = {"scored": -1}
+
+    def cb(p) -> None:
+        if p.scoring and p.scored != last["scored"]:
+            last["scored"] = p.scored
+            progress(p.scored + 1, p.scored + p.queued + len(p.scoring), p.scoring[-1])
+    return cb
 
 
 def ranked_rows(storage: Storage, include_skip: bool = False) -> list[tuple[FitResult, Job | None]]:

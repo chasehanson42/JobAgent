@@ -47,6 +47,8 @@ if not exist ".venv\scraping-attempted.txt" (
 )
 
 rem ---- 3. Start Ollama if it is installed but not running ----------------
+rem Let Ollama score two jobs at once (matches parallel.llm_workers in settings).
+if not defined OLLAMA_NUM_PARALLEL set "OLLAMA_NUM_PARALLEL=2"
 curl.exe -s -m 2 http://localhost:11434/api/version >nul 2>nul
 if errorlevel 1 if exist "%LOCALAPPDATA%\Programs\Ollama\ollama app.exe" (
   echo   Starting Ollama...

@@ -66,6 +66,7 @@ class OllamaClient:
     timeout: float = 180
     max_retries: int = 2
     num_ctx: int = 8192
+    keep_alive: str = "30m"
     name: str = "ollama"
 
     def chat(self, system: str, user: str, *, json_mode: bool = False,
@@ -73,6 +74,7 @@ class OllamaClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
+            "keep_alive": self.keep_alive,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "options": {"temperature": self.temperature if temperature is None else temperature,
@@ -149,7 +151,8 @@ def build_client(settings: dict[str, Any], provider: str | None = None) -> LLMCl
         cfg = llm.get("ollama", {})
         return OllamaClient(base_url=cfg.get("base_url", "http://localhost:11434"),
                             model=cfg.get("model", "qwen2.5:7b-instruct"),
-                            num_ctx=int(cfg.get("num_ctx", 8192)), **common)
+                            num_ctx=int(cfg.get("num_ctx", 8192)),
+                            keep_alive=str(cfg.get("keep_alive", "30m")), **common)
     if provider == "gemini":
         cfg = llm.get("gemini", {})
         env = cfg.get("api_key_env", "GEMINI_API_KEY")

@@ -47,6 +47,8 @@ class FitResult:
     skill_gaps: list[str]
     recommendation: Literal["Apply", "Skip"]
     rationale: str = ""
+    # "Why you fit": [{"requirement": what the job asks, "evidence": matching profile fact}]
+    fit_highlights: list[dict[str, str]] = field(default_factory=list)
     model: str = ""
     evaluated_at: str = ""
 

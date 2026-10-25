@@ -44,7 +44,12 @@ class AppLLM(ScriptedLLM):
         if "fit_score" in system.lower():
             return json.dumps({"fit_score": 82, "matched_skills": ["Scheduling", "QuickBooks"],
                                "skill_gaps": ["Medical billing"], "recommendation": "Apply",
-                               "rationale": "Strong office management fit."})
+                               "rationale": "Strong office management fit.",
+                               "fit_highlights": [
+                                   {"requirement": "Patient scheduling",
+                                    "evidence": "Scheduled 40 patients per day across 3 dentists "
+                                                "at Bluebird Dental."},
+                                   {"requirement": "Billing", "evidence": "Ran billing for 500 clinics."}]})
         if json_mode and "hallucinations" not in system.lower():
             return json.dumps({"summary": "Office manager who keeps a busy dental practice running.",
                                "skills": ["Scheduling", "QuickBooks"],
@@ -149,15 +154,17 @@ def test_full_flow(app_env):
     next(t for t in at.text_area if t.label == "Full job description").input(
         "Busy dental clinic needs an office manager for scheduling, QuickBooks bookkeeping, "
         "patient customer service and vendor management.")
-    next(b for b in at.button if b.label == "Add job").click().run()
+    _finish(next(b for b in at.button if b.label == "Add and score").click().run())
     assert not at.exception, at.exception
-    assert any("kept **1**" in s.value for s in at.success)
+    assert any("scored **1**" in s.value for s in at.success)     # ranked automatically
 
-    # Matches: score, then generate documents.
+    # Matches: already scored, with "why you fit" notes; then generate documents.
     at = _page("ranked").run()
-    _finish(_button(at, "Score 1 job(s) with AI").click().run())
     assert not at.exception, at.exception
     assert at.metric[0].value == "82"
+    why = next(m.value for m in at.markdown if "Why you fit" in m.value)
+    assert "Patient scheduling" in why and "Bluebird Dental" in why
+    assert "500 clinics" not in why                               # invented evidence dropped
     _finish(_button(at, "Create resume & cover letter").click().run())
     assert not at.exception, at.exception
     labels = [d.label for d in at.get("download_button")]
@@ -193,7 +200,7 @@ def test_task_keeps_running_when_user_clicks_elsewhere(app_env):
     at.toggle[0].set_value(True).run()
     other = _page("find").run()
     assert not other.exception
-    assert _button(other, "Save and search").disabled                       # one AI task at a time
+    assert _button(other, "Search and rank").disabled                       # one AI task at a time
     assert MANAGER.running() is not None
 
     release.set()
@@ -202,3 +209,38 @@ def test_task_keeps_running_when_user_clicks_elsewhere(app_env):
     assert MANAGER.get("rank").status == "done"
     assert json.loads((tmp_path / "data" / "rankings.json").read_text())[0]["fit_score"] == 82
     assert at.metric[0].value == "82"
+
+
+def test_search_and_rank_runs_in_one_step(app_env, monkeypatch):
+    tmp_path, _ = app_env
+    from core.models import Job, make_job_id
+    import scrapers.job_scraper as job_scraper
+    import webapp
+
+    core.settings.save_profile({"name": "Sam Rivera", "location": "Denver, CO",
+                                "target": {"titles": ["Office Manager"], "remote_ok": False},
+                                "skills": {"practices": ["Scheduling", "QuickBooks"]},
+                                "experience": [{"company": "Bluebird Dental", "title": "Office Manager",
+                                                "bullets": ["Scheduled 40 patients per day across 3 dentists"]}]})
+
+    def fake_query(q):
+        def mk(title, desc):
+            return Job(id=make_job_id(q.site, title, ""), title=title, company=f"{q.site} Co",
+                       location="Denver, CO", description=desc * 3)
+        return [mk("Office Manager", "Scheduling and QuickBooks for a busy clinic office. "),
+                mk("Forklift Driver", "Drive forklifts in the warehouse on night shifts. ")]
+
+    monkeypatch.setattr(job_scraper, "run_query", fake_query)
+    monkeypatch.setattr(webapp, "jobspy_available", lambda: True)
+
+    at = _page("find").run()
+    _finish(_button(at, "Search and rank").click().run())
+    assert not at.exception, at.exception
+    summary = next(s.value for s in at.success if "listings found" in s.value)
+    assert "**6** listings found" in summary          # 3 default sites x 1 location x 2 jobs
+    assert "scored **3**" in summary and "**3** good match(es)" in summary
+    skipped = next(e for e in at.expander if e.label.startswith("Why 3 job(s) were skipped"))
+    assert "doesn't mention your job titles or skills" in skipped.markdown[0].value
+
+    at = _page("ranked").run()
+    assert [m.value for m in at.metric] == ["82", "82", "82"]

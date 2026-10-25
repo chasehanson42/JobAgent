@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """FreeJobAgent CLI. (Prefer a browser? Run `streamlit run app.py` or the Start launcher.)
 
+    python orchestrator.py hunt                      # search + rank, in parallel
     python orchestrator.py scrape [--from-file jobs.json]
     python orchestrator.py rank [--limit N] [--rescore]
     python orchestrator.py list [--all]
@@ -34,6 +35,26 @@ def cmd_scrape(args: argparse.Namespace, settings: dict[str, Any], storage: Stor
     s = pipeline.scrape(settings, storage, raw)
     print(f"Scraped {s.scraped} | kept {s.kept} | dropped {len(s.dropped)} by rules "
           f"| {s.total_stored} total in {storage.jobs_path}")
+    return 0
+
+
+def cmd_hunt(args: argparse.Namespace, settings: dict[str, Any], storage: Storage) -> int:
+    client = build_client(settings, args.provider)
+    last = {"msg": ""}
+
+    def show(p) -> None:
+        if p.message != last["msg"]:
+            last["msg"] = p.message
+            print(f"  {p.message}", flush=True)
+
+    sm = pipeline.hunt(settings, storage, client, on_progress=show)
+    p = sm.progress
+    print(f"\nDone in {sm.seconds:.0f}s: {p.found} found, {p.filtered} filtered, "
+          f"{p.not_relevant} not relevant, {p.scored} scored, {p.apply} good matches"
+          + (f", {sm.unscored_left} left for `rank`" if sm.unscored_left else ""))
+    for label in p.failed_queries:
+        print(f"  search failed: {label}")
+    _print_rankings(storage, show_all=False)
     return 0
 
 
@@ -94,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", choices=["ollama", "gemini"], help="override llm.provider")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="command", required=True)
+
+    h = sub.add_parser("hunt", help="search all sites and rank the results, in parallel")
+    h.set_defaults(func=cmd_hunt)
 
     s = sub.add_parser("scrape", help="scrape, sanitize and rule-filter listings")
     s.add_argument("--from-file", help="import listings from a JSON/JSONL file instead of scraping")

@@ -12,6 +12,7 @@ llm:
     base_url: http://localhost:11434
     model: qwen2.5:7b-instruct      # alternatives: llama3.1:8b, mistral:7b
     num_ctx: 8192
+    keep_alive: 30m                 # keep the model loaded between jobs (reloading costs seconds)
 
   gemini:
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
@@ -47,8 +48,18 @@ filters:
 
 ranking:
   min_fit_score: 65                    # below this, recommendation is forced to Skip
-  max_jobs_per_run: 25                 # cap LLM calls per `rank`
-  max_description_chars: 12000
+  max_jobs_per_run: 30                 # cap on AI calls per search; the rest wait for "Score"
+  max_description_chars: 12000         # stored per job
+  prompt_description_chars: 4000       # sent to the AI when scoring; the AI reads every
+                                       # character first, so this is the biggest speed lever
+  prescreen_min_score: 2               # instant keyword check against your profile; jobs
+                                       # below it never reach the AI (pasted jobs always do)
+
+parallel:
+  search_workers: 4                    # job sites searched at the same time
+  llm_workers: 2                       # jobs the AI scores at the same time. Ollama must allow
+                                       # it too: the launchers set OLLAMA_NUM_PARALLEL when
+                                       # they start Ollama. Extra workers just wait otherwise.
 
 generation:
   critic_max_rounds: 2

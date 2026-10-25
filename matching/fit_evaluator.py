@@ -24,6 +24,17 @@ from scrapers.sanitizer import UNTRUSTED_DATA_POLICY, sanitize_text, wrap_untrus
 MAX_LIST_ITEMS = 25
 MAX_ITEM_CHARS = 80
 MAX_RATIONALE_CHARS = 600
+MAX_HIGHLIGHTS = 4
+MAX_REQUIREMENT_CHARS = 80
+MAX_EVIDENCE_CHARS = 220
+GROUNDING_MIN_RATIO = 0.5
+_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_EVIDENCE_STOPWORDS = frozenset({
+    "with", "from", "that", "this", "have", "years", "year", "experience", "worked",
+    "work", "using", "their", "which", "where", "when", "into", "over", "more", "than",
+    "also", "including", "through", "while", "across",
+})
 INJECTION_NOTE = "Note: job text contained prompt-injection attempts that were removed."
 
 JSON_SCHEMA = """{
@@ -31,7 +42,8 @@ JSON_SCHEMA = """{
   "matched_skills": [<string>, ...],
   "skill_gaps": [<string>, ...],
   "recommendation": "Apply" | "Skip",
-  "rationale": "<at most 2 sentences>"
+  "rationale": "<at most 2 sentences>",
+  "fit_highlights": [{"requirement": "<what the job asks for, a few words>", "evidence": "<the candidate's matching experience from the profile, one short sentence>"}, ...]
 }"""
 
 SCORING_RUBRIC = """Scoring rubric:
@@ -42,7 +54,10 @@ SCORING_RUBRIC = """Scoring rubric:
 - 0-39: different discipline or mostly unmet requirements.
 Only list a skill in matched_skills if it appears in the candidate profile AND is
 relevant to the job. List required job skills the candidate lacks in skill_gaps.
-Recommend "Apply" only for a genuinely good fit; otherwise "Skip"."""
+Recommend "Apply" only for a genuinely good fit; otherwise "Skip".
+fit_highlights: at most 4, only for genuine matches. Each evidence must come only
+from the candidate profile and be specific (employer, years, accomplishment);
+never mention anything not in the profile. Use [] if nothing matches well."""
 
 
 def _build_system_prompt() -> str:
@@ -126,6 +141,46 @@ def _coerce_recommendation(value: Any) -> str:
     return "Apply" if text == "apply" else "Skip"
 
 
+_HARMLESS_FLAGS = {"repeated_char_run", "truncated", "zero_width_chars", "invisible_chars", "control_chars"}
+
+
+def _clean_highlight_field(value: Any, limit: int) -> str:
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return ""
+    text = " ".join(str(value).split())
+    # Defense in depth: model output may echo (injected) job text. A highlight
+    # that needed cleaning was written under the job's influence: drop it.
+    res = sanitize_text(text)
+    if any(f not in _HARMLESS_FLAGS for f in res.flags):
+        return ""
+    return res.text[:limit].strip()
+
+
+def _coerce_highlights(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        requirement = _clean_highlight_field(item.get("requirement"), MAX_REQUIREMENT_CHARS)
+        evidence = _clean_highlight_field(item.get("evidence"), MAX_EVIDENCE_CHARS)
+        if not requirement or not evidence or requirement.lower() in seen:
+            continue
+        seen.add(requirement.lower())
+        out.append({"requirement": requirement, "evidence": evidence})
+    return out
+
+
+def _numbers(text: str) -> set[str]:
+    return {n.replace(",", "") for n in _NUMBER_RE.findall(text)}
+
+
+def _norm_token(token: str) -> str:
+    return token[:-1] if len(token) > 4 and token.endswith("s") else token
+
+
 def _limit_sentences(text: str, max_sentences: int = 2) -> str:
     text = " ".join(str(text or "").split())
     count = 0
@@ -147,6 +202,10 @@ class FitEvaluator:
         self.max_description_chars = int(max_description_chars)
         self._profile_text = self._render_profile(self.profile)
         self._profile_haystack = " ".join(_flatten_text(self.profile)).lower()
+        # Immutable lookups used to ground "why you fit" highlights.
+        self._profile_numbers = frozenset(_numbers(self._profile_haystack))
+        self._profile_tokens = frozenset(
+            _norm_token(t) for t in _TOKEN_RE.findall(self._profile_haystack))
         name = getattr(client, "name", "") or ""
         model = getattr(client, "model", "") or ""
         self.model_label = f"{name}:{model}" if model else name
@@ -204,12 +263,25 @@ class FitEvaluator:
             "skill_gaps": _coerce_str_list(data.get("skill_gaps")),
             "recommendation": _coerce_recommendation(data.get("recommendation")),
             "rationale": _limit_sentences(data.get("rationale", "")),
+            "fit_highlights": _coerce_highlights(data.get("fit_highlights")),
         }
 
     def _is_grounded(self, skill: str) -> bool:
         # Word-boundary match so e.g. "Go" is not grounded by "Google".
         pattern = r"(?<![\w])" + re.escape(skill.lower()) + r"(?![\w])"
         return re.search(pattern, self._profile_haystack) is not None
+
+    def _highlight_is_grounded(self, evidence: str) -> bool:
+        """Reject evidence with invented figures or mostly non-profile content."""
+        lowered = evidence.lower()
+        if not _numbers(lowered) <= self._profile_numbers:
+            return False
+        words = [t for t in _TOKEN_RE.findall(lowered)
+                 if len(t) >= 4 and t not in _EVIDENCE_STOPWORDS and not t.isdigit()]
+        if not words:
+            return True
+        hits = sum(1 for t in words if _norm_token(t) in self._profile_tokens)
+        return hits / len(words) >= GROUNDING_MIN_RATIO
 
     # ----- public API -----------------------------------------------------
     def evaluate(self, job: Job) -> FitResult:
@@ -224,6 +296,8 @@ class FitEvaluator:
             parsed = self._parse(raw)
 
         matched = [s for s in parsed["matched_skills"] if self._is_grounded(s)]
+        highlights = [h for h in parsed["fit_highlights"]
+                      if self._highlight_is_grounded(h["evidence"])][:MAX_HIGHLIGHTS]
         recommendation = parsed["recommendation"]
         if parsed["fit_score"] < self.min_fit_score:
             recommendation = "Skip"
@@ -240,6 +314,7 @@ class FitEvaluator:
             skill_gaps=parsed["skill_gaps"],
             recommendation=recommendation,  # type: ignore[arg-type]
             rationale=rationale,
+            fit_highlights=highlights,
             model=self.model_label,
             evaluated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )

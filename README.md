@@ -12,7 +12,8 @@ tailored ATS resume and cover letter grounded only in your own profile.
 3. Double-click **`Start JobAgent.bat`** (Windows) or **`Start JobAgent.command`** (Mac).
    The first start takes a few minutes; then JobAgent opens in your browser.
 4. Follow the **Setup** page: download the AI model, upload your resume, check it, save.
-5. **Find jobs** (search job sites or paste a posting), then **Your matches** →
+5. **Find jobs** → **Search and rank** (or paste a posting). Matches appear on
+   **Your matches** as they're scored, each with "Why you fit" notes →
    **Create resume & cover letter** → download PDF or Word.
 
 Keep the black launcher window open while you use JobAgent; close it to stop.
@@ -35,7 +36,7 @@ free_job_agent/
 ├── Start JobAgent.bat/.command  # double-click launchers (set up .venv, then run launch.py)
 ├── launch.py                  # starts Streamlit, waits for it, opens the browser
 ├── app.py / webapp.py         # browser UI: Setup, My profile, Find jobs, Your matches
-├── orchestrator.py            # CLI: scrape | rank | list | generate | check
+├── orchestrator.py            # CLI: hunt | scrape | rank | list | generate | check
 ├── config/
 │   ├── settings.yaml          # LLM provider toggle, scrape targets, filters
 │   └── candidate_profile.yaml # master profile: the only source of truth
@@ -44,7 +45,9 @@ free_job_agent/
 │   ├── llm_client.py          # OllamaClient / GeminiFreeTierClient + build_client()
 │   ├── models.py              # Job, FitResult dataclasses
 │   ├── storage.py             # data/*.jsonl, rankings.json, build/<job_id>/
-│   ├── pipeline.py            # scrape/rank/generate steps shared by CLI and web UI
+│   ├── pipeline.py            # hunt/scrape/rank/generate steps shared by CLI and web UI
+│   ├── agents.py              # parallel search + scoring agents (HuntPipeline)
+│   ├── background.py          # runs long tasks off the page so clicks don't cancel them
 │   ├── ollama_admin.py        # is Ollama running, which models, pull with progress
 │   └── jsonutil.py            # robust JSON extraction from LLM output
 ├── scrapers/
@@ -52,6 +55,7 @@ free_job_agent/
 │   └── sanitizer.py           # HTML/script/injection stripping, untrusted wrappers
 ├── matching/
 │   ├── filter_engine.py       # deterministic rules (title, location, salary, ...)
+│   ├── prescreen.py           # instant keyword relevance vs. the profile
 │   └── fit_evaluator.py       # LLM scoring -> fit_score, matched_skills, gaps, rec
 ├── generators/
 │   ├── resume_tailor.py       # rewrites bullets from verified profile facts only
@@ -94,6 +98,41 @@ python orchestrator.py generate --job-id <ID>      # writes build/<ID>/resume.{m
 ```
 
 `--provider ollama|gemini` (or `FJA_LLM_PROVIDER`) overrides the configured backend.
+
+## How search and ranking run in parallel
+
+```
+search agents (one per job site) ─► sanitize ─► your filters ─► instant pre-screen
+                                                                      │
+                     priority queue, most relevant first ◄────────────┘
+                                  │
+scoring agents (N at once) ◄──────┘ ─► rankings.json, saved as each job finishes
+```
+
+- **Search agents** (`core/agents.py`): every job site gets its own agent, so
+  sites are searched at the same time. Queries to the *same* site still run
+  one after another, with a pause, to avoid being blocked.
+- **Pre-screen** (`matching/prescreen.py`): a keyword check of each job against
+  your titles and skills, with no AI. Jobs that mention none of them never
+  reach the AI. Pasted jobs are always scored.
+- **Scoring agents** start as soon as the first jobs arrive, take the most
+  relevant job first, and save each result straight away, so the matches page
+  fills in while the search is still running. `ranking.max_jobs_per_run` caps
+  AI calls per search; the rest wait for a "Score" click.
+- **Speed settings** (`config/settings.yaml`): `ranking.prompt_description_chars`
+  (default 4000) is how much of each posting the AI reads. On a laptop CPU,
+  reading the prompt is most of the time per job, so this matters most.
+  `parallel.llm_workers` (default 2) is how many jobs are scored at once.
+  Ollama only runs them together if `OLLAMA_NUM_PARALLEL` allows it; the
+  launchers set it to 2 when *they* start Ollama. If Ollama was already running,
+  quit it from the tray/menu bar and start JobAgent again. On a CPU without a
+  GPU, parallel scoring helps less than on a GPU.
+- **"Why you fit"**: the AI pairs each job requirement with the matching fact
+  from your profile. A note is dropped if it cites a number that isn't in
+  your profile, if it is mostly made of words that aren't in your profile, or
+  if it repeats manipulative text from the posting.
+
+CLI equivalent: `python orchestrator.py hunt`.
 
 ## Safety model
 
