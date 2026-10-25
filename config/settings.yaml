@@ -13,6 +13,7 @@ llm:
     model: qwen2.5:7b-instruct      # alternatives: llama3.1:8b, mistral:7b
     num_ctx: 8192
     keep_alive: 30m                 # keep the model loaded between jobs (reloading costs seconds)
+    scoring_model: ""               # optional smaller model for quick ratings, e.g. qwen2.5:3b-instruct
 
   gemini:
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
@@ -47,11 +48,20 @@ filters:
   description_blacklist: ["security clearance required", "ts/sci"]
 
 ranking:
-  min_fit_score: 65                    # below this, recommendation is forced to Skip
-  max_jobs_per_run: 30                 # cap on AI calls per search; the rest wait for "Score"
+  min_fit_score: 65                    # below this, recommendation is Skip
+  max_jobs_per_run: 30                 # cap on quick AI ratings per search; the rest wait for "Score"
   max_description_chars: 12000         # stored per job
-  prompt_description_chars: 4000       # sent to the AI when scoring; the AI reads every
-                                       # character first, so this is the biggest speed lever
+  quick_description_chars: 1500        # quick rating reads only the essentials of a posting
+                                       # (requirements, duties); the AI reads every character
+                                       # before answering, so this is the biggest speed lever
+  prompt_description_chars: 4000       # detailed "Why you fit" reads this much
+  explain_top: 5                       # auto-explain only the best few; others have a button
+  weights:                             # how the 0-100 score is made up (any numbers; scaled to 100)
+    skills: 35                         # AI rating 1-5
+    experience: 25                     # AI rating 1-5
+    title: 15                          # job title vs. the titles you want (no AI)
+    location: 15                       # distance from home vs. your commute (no AI)
+    local: 10                          # small employer near home (no AI; profile can switch off)
   prescreen_min_score: 2               # instant keyword check against your profile; jobs
                                        # below it never reach the AI (pasted jobs always do)
 
@@ -62,7 +72,9 @@ parallel:
                                        # they start Ollama. Extra workers just wait otherwise.
 
 generation:
-  critic_max_rounds: 2
+  critic_max_rounds: 1                 # one AI review + fix per document
+  recheck_with_llm: false              # re-check fixes with instant checks only (saves an AI call)
+  parallel: true                       # write resume and cover letter at the same time
   export_formats: [md, pdf, docx]
 
 paths:

@@ -13,8 +13,8 @@ tailored ATS resume and cover letter grounded only in your own profile.
    The first start takes a few minutes; then JobAgent opens in your browser.
 4. Follow the **Setup** page: download the AI model, upload your resume, check it, save.
 5. **Find jobs** → **Search and rank** (or paste a posting). Matches appear on
-   **Your matches** as they're scored, each with "Why you fit" notes →
-   **Create resume & cover letter** → download PDF or Word.
+   **Your matches** as they're scored, best first, with a score breakdown →
+   **Create resume & cover letter** → one download with both, as PDF and Word.
 
 Keep the black launcher window open while you use JobAgent; close it to stop.
 On a Mac, the first time macOS may refuse to open the file: right-click it → **Open** → **Open**.
@@ -56,6 +56,9 @@ free_job_agent/
 ├── matching/
 │   ├── filter_engine.py       # deterministic rules (title, location, salary, ...)
 │   ├── prescreen.py           # instant keyword relevance vs. the profile
+│   ├── essentials.py          # requirements/duties excerpt for the quick rating
+│   ├── scoring.py             # 0-100 score from AI ratings + title/distance/employer
+│   ├── location.py            # offline distance from home (towns of 500+ people)
 │   └── fit_evaluator.py       # LLM scoring -> fit_score, matched_skills, gaps, rec
 ├── generators/
 │   ├── resume_tailor.py       # rewrites bullets from verified profile facts only
@@ -99,38 +102,56 @@ python orchestrator.py generate --job-id <ID>      # writes build/<ID>/resume.{m
 
 `--provider ollama|gemini` (or `FJA_LLM_PROVIDER`) overrides the configured backend.
 
-## How search and ranking run in parallel
+## How search and ranking work
 
 ```
 search agents (one per job site) ─► sanitize ─► your filters ─► instant pre-screen
                                                                       │
                      priority queue, most relevant first ◄────────────┘
                                   │
-scoring agents (N at once) ◄──────┘ ─► rankings.json, saved as each job finishes
+AI agents (N at once) ◄───────────┘
+   1. quick rating for every job  ─► score saved at once, list fills in live
+   2. "Why you fit" for the top few, after all quick ratings are done
 ```
+
+**Big picture first.** On a laptop the AI spends most of its time *reading*,
+then *writing*. So the quick rating reads only the essentials of a posting
+(title plus requirement and duty lines, about 1,500 characters; benefits, legal
+text and "about us" are skipped) and answers with two 1–5 ratings and up to
+three missing items (about 30 words). The detailed "Why you fit" is written only
+for the best `ranking.explain_top` matches (default 5); any other match has an
+**Explain** button.
+
+**The score** (0–100) adds up parts you can see on each match:
+
+| Part | Points | Comes from |
+|---|---|---|
+| Skills | 35 | AI rating 1–5 |
+| Experience | 25 | AI rating 1–5 |
+| Job title match | 15 | your wanted titles vs. the job title (no AI) |
+| Distance from home | 15 | miles from your town vs. your commute radius (no AI) |
+| Small local employer | 10 | company size from the job site, if local (no AI) |
+
+Change the weights under `ranking.weights`. A job with a skills rating of 2
+or lower is never recommended, however close it is.
 
 - **Search agents** (`core/agents.py`): every job site gets its own agent, so
   sites are searched at the same time. Queries to the *same* site still run
   one after another, with a pause, to avoid being blocked.
-- **Pre-screen** (`matching/prescreen.py`): a keyword check of each job against
-  your titles and skills, with no AI. Jobs that mention none of them never
-  reach the AI. Pasted jobs are always scored.
-- **Scoring agents** start as soon as the first jobs arrive, take the most
-  relevant job first, and save each result straight away, so the matches page
-  fills in while the search is still running. `ranking.max_jobs_per_run` caps
-  AI calls per search; the rest wait for a "Score" click.
-- **Speed settings** (`config/settings.yaml`): `ranking.prompt_description_chars`
-  (default 4000) is how much of each posting the AI reads. On a laptop CPU,
-  reading the prompt is most of the time per job, so this matters most.
-  `parallel.llm_workers` (default 2) is how many jobs are scored at once.
-  Ollama only runs them together if `OLLAMA_NUM_PARALLEL` allows it; the
-  launchers set it to 2 when *they* start Ollama. If Ollama was already running,
-  quit it from the tray/menu bar and start JobAgent again. On a CPU without a
-  GPU, parallel scoring helps less than on a GPU.
-- **"Why you fit"**: the AI pairs each job requirement with the matching fact
-  from your profile. A note is dropped if it cites a number that isn't in
-  your profile, if it is mostly made of words that aren't in your profile, or
-  if it repeats manipulative text from the posting.
+- **Pre-screen** (`matching/prescreen.py`): a keyword check against your titles
+  and skills; jobs that mention none of them never reach the AI. Pasted jobs are
+  always scored. Jobs you mark **Not interested** or **Clear** are never scored
+  again.
+- **AI speed**: the search summary shows how fast the AI reads and writes on
+  your computer. **Setup → Faster job scoring** can use a small model
+  (`qwen2.5:3b-instruct`) for quick ratings, roughly twice as fast, while
+  explanations and documents keep the main model.
+- `parallel.llm_workers` (default 2) is how many AI calls run at once. Ollama
+  only runs them together if `OLLAMA_NUM_PARALLEL` allows it. The launchers set
+  it when *they* start Ollama, so quit Ollama from the tray first. On a CPU
+  without a graphics card this helps less.
+- **Documents**: the resume and cover letter are written at the same time, with
+  one AI review each. You download both as one zip, in PDF and Word.
 
 CLI equivalent: `python orchestrator.py hunt`.
 

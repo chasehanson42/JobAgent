@@ -58,6 +58,25 @@ class Storage:
     def get_job(self, job_id: str) -> Job | None:
         return next((j for j in self.load_jobs() if j.id == job_id), None)
 
+    # ----- jobs the user dismissed ("Not interested" / "Clear list") ---------
+    @property
+    def hidden_path(self) -> Path:
+        return self.data_dir / "hidden_jobs.json"
+
+    def load_hidden(self) -> set[str]:
+        if not self.hidden_path.exists():
+            return set()
+        return set(json.loads(self.hidden_path.read_text(encoding="utf-8")))
+
+    def hide(self, job_ids: set[str] | list[str]) -> None:
+        """Remove jobs from the list and remember them so later searches skip them."""
+        ids = set(job_ids)
+        if not ids:
+            return
+        self.hidden_path.write_text(json.dumps(sorted(self.load_hidden() | ids)), encoding="utf-8")
+        self.save_jobs([j for j in self.load_jobs() if j.id not in ids])
+        self.save_rankings([r for r in self.load_rankings() if r.job_id not in ids])
+
     def save_rankings(self, results: list[FitResult]) -> None:
         ordered = sorted(results, key=lambda r: r.fit_score, reverse=True)
         self.rankings_path.write_text(

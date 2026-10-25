@@ -11,6 +11,12 @@ the same site still run one after another, with a pause, to stay polite.
 Scoring starts as soon as the first jobs arrive instead of waiting for the
 whole search, and the pre-screen keeps jobs that plainly don't match the
 profile away from the (slow, local) AI entirely.
+
+Scoring is big-picture first. Every job gets a *quick* AI pass (two 1-5
+ratings from the essentials of the posting, ~30 words of output); distance,
+employer size and title match are computed without the AI. Only the top
+matches then get the slow, detailed "Why you fit" explanation, and only
+after every job has its quick score.
 """
 from __future__ import annotations
 
@@ -29,8 +35,9 @@ from core.models import FitResult, Job
 from core.settings import load_profile
 from core.storage import Storage
 from matching.filter_engine import FilterEngine
-from matching.fit_evaluator import FitEvaluator
+from matching.fit_evaluator import FitEvaluator, QuickRating
 from matching.prescreen import is_relevant, profile_terms, relevance
+from matching.scoring import ScoreParts, combine, location_parts, recommend, title_match, weights_for
 from scrapers import job_scraper
 from scrapers.job_scraper import SearchQuery
 from scrapers.sanitizer import sanitize_job
@@ -39,6 +46,7 @@ log = logging.getLogger(__name__)
 
 SAME_SITE_DELAY_SECONDS = 2.0
 MANUAL_PRIORITY = 1000.0      # jobs the user added by hand are scored first
+EXPLAIN_PRIORITY = -10_000.0  # explanations wait until every quick score is done
 
 
 @dataclass
@@ -52,13 +60,16 @@ class HuntProgress:
     scoring: list[str] = field(default_factory=list)
     scored: int = 0
     apply: int = 0             # scored as a good match
+    explained: int = 0         # "Why you fit" written
+    explain_total: int = 0
     failed_queries: list[str] = field(default_factory=list)
     search_done: bool = False
 
     @property
     def fraction(self) -> float:
-        expected = self.scored + self.queued + len(self.scoring)
-        score_frac = self.scored / expected if expected else (1.0 if self.search_done else 0.0)
+        expected = self.scored + self.explained + self.queued + len(self.scoring)
+        done = self.scored + self.explained
+        score_frac = done / expected if expected else (1.0 if self.search_done else 0.0)
         if not self.queries_total:
             return score_frac
         return 0.25 * (self.queries_done / self.queries_total) + 0.75 * score_frac
@@ -68,11 +79,13 @@ class HuntProgress:
         parts = []
         if self.queries_total:
             parts.append(f"Searched {self.queries_done} of {self.queries_total}")
-        expected = self.scored + self.queued + len(self.scoring)
-        if expected or self.search_done:
-            parts.append(f"scored {self.scored} of {expected}")
+        to_score = self.scored + self.queued + len(self.scoring) - (self.explain_total - self.explained)
+        if to_score or self.search_done:
+            parts.append(f"scored {self.scored} of {max(to_score, self.scored)}")
         if self.apply:
             parts.append(f"{self.apply} good match{'es' if self.apply != 1 else ''}")
+        if self.explain_total:
+            parts.append(f"explained {self.explained} of {self.explain_total}")
         return " · ".join(parts) or "Starting..."
 
 
@@ -84,6 +97,7 @@ class HuntSummary:
     unscored_left: int
     injection_flagged: int
     seconds: float
+    ai_speed: str = ""         # e.g. "30 AI calls, 21s each · reading 45 words/s, writing 6 words/s"
 
 
 class HuntPipeline:
@@ -94,6 +108,7 @@ class HuntPipeline:
     """
 
     def __init__(self, settings: dict[str, Any], storage: Storage, client: LLMClient | None = None, *,
+                 scoring_client: LLMClient | None = None,
                  query_fn: Callable[[SearchQuery], list[Job]] | None = None,
                  on_progress: Callable[[HuntProgress], None] | None = None,
                  sleep: Callable[[float], None] = time.sleep) -> None:
@@ -109,21 +124,31 @@ class HuntPipeline:
         self.budget = int(rank.get("max_jobs_per_run", 30))
         self.min_relevance = float(rank.get("prescreen_min_score", 2))
         self.store_chars = int(rank.get("max_description_chars", 12000))
+        self.essentials_chars = int(rank.get("quick_description_chars", 1500))
+        self.explain_top = int(rank.get("explain_top", 5))
+        self.min_fit_score = int(rank.get("min_fit_score", 65))
 
-        profile = load_profile(settings)
+        self.profile = profile = load_profile(settings)
         self.filter = FilterEngine(settings.get("filters", {}), profile)
         self.terms = profile_terms(profile)
+        self.weights = weights_for(settings, profile)
+        self.target_titles = [str(t) for t in (profile.get("target") or {}).get("titles") or []]
+        self.clients = [c for c in (client, scoring_client) if c is not None]
         self.evaluator = None if client is None else FitEvaluator(
-            client, profile,
-            min_fit_score=int(rank.get("min_fit_score", 65)),
+            scoring_client or client, profile, min_fit_score=self.min_fit_score)
+        self.explainer = None if client is None else FitEvaluator(
+            client, profile, min_fit_score=self.min_fit_score,
             max_description_chars=int(rank.get("prompt_description_chars", 4000)))
 
         self.progress = HuntProgress()
         self._lock = threading.Lock()
-        self._queue: queue.PriorityQueue[tuple[float, int, Job]] = queue.PriorityQueue()
+        self._queue: queue.PriorityQueue[tuple[float, int, str, Job]] = queue.PriorityQueue()
         self._seq = 0
         self._started = 0
-        self._seen: set[str] = set()
+        self._explains = 0
+        self._leftover = 0
+        self._hidden = storage.load_hidden()
+        self._seen: set[str] = set(self._hidden)
         self._ranked_ids = {r.job_id for r in storage.load_rankings()}
         self._raw: list[Job] = []
         self._dropped: list[tuple[Job, list[str]]] = []
@@ -146,7 +171,7 @@ class HuntPipeline:
             stored = self.storage.load_jobs()
             self._seen.update(j.id for j in stored)
             for job in stored:
-                if rescore or job.id not in self._ranked_ids:
+                if (rescore or job.id not in self._ranked_ids) and job.id not in self._hidden:
                     self._enqueue(job, relevance(job, self.terms))
         new_jobs = list(new_jobs)
         if new_jobs:
@@ -174,8 +199,11 @@ class HuntPipeline:
         self._finish()
         if self._fatal is not None:
             raise self._fatal
+        unscored = self._leftover + sum(1 for _, _, kind, _ in list(self._queue.queue) if kind == "score")
+        speed = " · ".join(filter(None, (getattr(c, "stats", None) and c.stats.summary()
+                                         for c in dict.fromkeys(self.clients))))
         return HuntSummary(replace(self.progress), list(self._results), list(self._dropped),
-                           self._queue.qsize(), self._injection, time.time() - t0)
+                           unscored, self._injection, time.time() - t0, speed)
 
     # ---------------------------------------------------------------- search
 
@@ -230,40 +258,49 @@ class HuntPipeline:
 
     # ---------------------------------------------------------------- scoring
 
-    def _enqueue(self, job: Job, priority: float) -> None:
+    def _enqueue(self, job: Job, priority: float, kind: str = "score") -> None:
         with self._lock:
             self._seq += 1
-            self._queue.put((-priority, self._seq, job))
+            self._queue.put((-priority, self._seq, kind, job))
             self.progress.queued = self._queue.qsize()
 
-    def _next_job(self) -> Job | None:
+    def _next_work(self) -> tuple[str, Job] | None:
         while self._fatal is None:
             with self._lock:
-                if self._started >= self.budget:
-                    return None
                 try:
-                    _, _, job = self._queue.get_nowait()
+                    item = self._queue.get_nowait()
                 except queue.Empty:
-                    job = None
+                    item = None
                 else:
-                    self._started += 1
+                    _, _, kind, job = item
+                    if kind == "score" and self._started >= self.budget:
+                        # Out of quick-score budget: it stays stored, unscored, for next time.
+                        self._leftover += 1
+                        self.progress.queued = self._queue.qsize()
+                        continue
+                    if kind == "score":
+                        self._started += 1
                     self.progress.queued = self._queue.qsize()
-            if job is not None:
-                return job
+            if item is not None:
+                return kind, job
             if self._search_done.is_set() and self._queue.empty():
                 return None
             time.sleep(0.05)
         return None
 
     def _score_agent(self) -> None:
-        assert self.evaluator is not None
-        while (job := self._next_job()) is not None:
+        assert self.evaluator is not None and self.explainer is not None
+        while (work := self._next_work()) is not None:
+            kind, job = work
             label = f"{job.title} @ {job.company}"
             with self._lock:
                 self.progress.scoring.append(label)
             self._report()
             try:
-                result = self.evaluator.evaluate(job)
+                if kind == "score":
+                    result = self._quick_score(job)
+                else:
+                    result = self._explain(job)
             except LLMError as exc:
                 # The AI itself is unreachable or too slow: stop instead of
                 # filling the list with failed scores. The job stays unscored.
@@ -272,20 +309,50 @@ class HuntPipeline:
                     self.progress.scoring.remove(label)
                 return
             except Exception as exc:  # noqa: BLE001 - one odd reply must not stop the rest
+                if kind == "explain":
+                    log.warning("Explaining %s failed: %s", label, exc)
+                    with self._lock:
+                        self.progress.scoring.remove(label)
+                        self.progress.explained += 1
+                    continue
                 result = FitResult(
                     job_id=job.id, fit_score=0, matched_skills=[], skill_gaps=[], recommendation="Skip",
                     rationale=f"evaluation_error: {type(exc).__name__}: {str(exc)[:200]}",
                     model=self.evaluator.model_label,
                     evaluated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            explain_next = False
             with self._lock:
                 self.progress.scoring.remove(label)
-                self.progress.scored += 1
-                self.progress.apply += result.recommendation == "Apply"
-                self._results.append(result)
                 merged = {r.job_id: r for r in self.storage.load_rankings()}
+                if kind == "score":
+                    self.progress.scored += 1
+                    self.progress.apply += result.recommendation == "Apply"
+                    self._results.append(result)
+                    if result.recommendation == "Apply" and self._explains < self.explain_top:
+                        self._explains += 1
+                        self.progress.explain_total += 1
+                        explain_next = True
+                else:
+                    self.progress.explained += 1
                 merged[result.job_id] = result
                 self.storage.save_rankings(list(merged.values()))
+            if explain_next:
+                self._enqueue(job, EXPLAIN_PRIORITY + result.fit_score, kind="explain")
             self._report()
+
+    def _quick_score(self, job: Job) -> FitResult:
+        assert self.evaluator is not None
+        rating = self.evaluator.quick_rate(job, self.essentials_chars)
+        return score_job(job, rating, self.profile, self.weights, self.target_titles,
+                         self.min_fit_score, self.evaluator.model_label)
+
+    def _explain(self, job: Job) -> FitResult:
+        """Add the detailed "Why you fit" to an existing quick score (the score itself stays)."""
+        assert self.explainer is not None
+        current = next((r for r in self.storage.load_rankings() if r.job_id == job.id), None)
+        detail = self.explainer.evaluate(job)
+        return merge_explanation(current, detail)
+
 
     # ---------------------------------------------------------------- helpers
 
@@ -305,3 +372,27 @@ class HuntPipeline:
                                      [{"id": j.id, "title": j.title, "company": j.company, "reasons": r}
                                       for j, r in self._dropped])
             self.progress.queued = self._queue.qsize()
+
+
+def score_job(job: Job, rating: QuickRating, profile: dict[str, Any], weights: dict[str, float],
+              target_titles: list[str], min_fit_score: int, model_label: str = "") -> FitResult:
+    loc, local, loc_label, emp_label = location_parts(job, profile)
+    parts = ScoreParts(skills=rating.skills, experience=rating.experience,
+                       title=title_match(job.title, target_titles), location=loc, local=local,
+                       location_label=loc_label, employer_label=emp_label)
+    score, points = combine(parts, weights)
+    return FitResult(
+        job_id=job.id, fit_score=score, matched_skills=[], skill_gaps=rating.missing,
+        recommendation=recommend(score, parts, min_fit_score),  # type: ignore[arg-type]
+        ratings={"skills": rating.skills, "experience": rating.experience},
+        score_points=points, labels=[x for x in (loc_label, emp_label) if x],
+        model=model_label, evaluated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+
+def merge_explanation(current: FitResult | None, detail: FitResult) -> FitResult:
+    if current is None:          # no quick score yet: the detailed result stands alone
+        detail.explained = True
+        return detail
+    return replace(current, fit_highlights=detail.fit_highlights, matched_skills=detail.matched_skills,
+                   skill_gaps=detail.skill_gaps or current.skill_gaps, rationale=detail.rationale,
+                   explained=True)

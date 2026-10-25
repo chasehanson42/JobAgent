@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,7 +94,7 @@ def unranked_jobs(storage: Storage, rescore: bool = False) -> list[Job]:
 
 def rank(settings: dict[str, Any], storage: Storage, client: LLMClient, *,
          limit: int | None = None, rescore: bool = False,
-         progress: Progress | None = None) -> list[FitResult]:
+         progress: Progress | None = None, scoring_client: LLMClient | None = None) -> list[FitResult]:
     """Score stored jobs that have no score yet (parallel scoring agents); returns new results."""
     from core.agents import HuntPipeline
 
@@ -99,7 +102,8 @@ def rank(settings: dict[str, Any], storage: Storage, client: LLMClient, *,
         raise PipelineError("No jobs found yet. Search for jobs first.")
     if not unranked_jobs(storage, rescore):
         return []
-    hunt_ = HuntPipeline(settings, storage, client, on_progress=_progress_adapter(progress))
+    hunt_ = HuntPipeline(settings, storage, client, scoring_client=scoring_client,
+                         on_progress=_progress_adapter(progress))
     if limit:
         hunt_.budget = limit
     return hunt_.run(score_stored=True, rescore=rescore).results
@@ -107,13 +111,35 @@ def rank(settings: dict[str, Any], storage: Storage, client: LLMClient, *,
 
 def hunt(settings: dict[str, Any], storage: Storage, client: LLMClient | None, *,
          new_jobs: list[Job] | None = None, search: bool = True,
-         on_progress: Callable[[Any], None] | None = None):
+         on_progress: Callable[[Any], None] | None = None,
+         scoring_client: LLMClient | None = None):
     """Search the job sites and score what fits, all in parallel. Returns a HuntSummary."""
     from core.agents import HuntPipeline
     from scrapers.job_scraper import build_queries
 
     queries = build_queries(settings.get("scrape", {})) if search else []
-    return HuntPipeline(settings, storage, client, on_progress=on_progress).run(queries, new_jobs or [])
+    return HuntPipeline(settings, storage, client, scoring_client=scoring_client,
+                        on_progress=on_progress).run(queries, new_jobs or [])
+
+
+def explain(settings: dict[str, Any], storage: Storage, client: LLMClient, job_id: str) -> FitResult:
+    """Write the detailed "Why you fit" for one match on request; its score stays the same."""
+    from core.agents import merge_explanation
+    from matching.fit_evaluator import FitEvaluator
+
+    job = storage.get_job(job_id)
+    if job is None:
+        raise PipelineError("That job is no longer in your list.")
+    rank_cfg = settings.get("ranking", {})
+    detail = FitEvaluator(client, load_profile(settings),
+                          min_fit_score=int(rank_cfg.get("min_fit_score", 65)),
+                          max_description_chars=int(rank_cfg.get("prompt_description_chars", 4000))
+                          ).evaluate(job)
+    rankings = {r.job_id: r for r in storage.load_rankings()}
+    result = merge_explanation(rankings.get(job_id), detail)
+    rankings[job_id] = result
+    storage.save_rankings(list(rankings.values()))
+    return result
 
 
 def _progress_adapter(progress: Progress | None):
@@ -143,6 +169,7 @@ class GenerateResult:
     out_dir: Path
     files: list[Path]
     reports: dict[str, dict[str, Any]] = field(default_factory=dict)
+    bundle: Path | None = None
 
     @property
     def passed(self) -> bool:
@@ -165,24 +192,49 @@ def generate(settings: dict[str, Any], storage: Storage, client: LLMClient, job_
         raise PipelineError(f"This job scored {fit.fit_score} (Skip). Generate anyway with force.")
 
     gen_cfg = settings.get("generation", {})
-    rounds = int(gen_cfg.get("critic_max_rounds", 2))
+    rounds = int(gen_cfg.get("critic_max_rounds", 1))
+    recheck = bool(gen_cfg.get("recheck_with_llm", False))
     formats = list(gen_cfg.get("export_formats", ["md", "pdf", "docx"]))
     profile = load_profile(settings)
     critic = CriticAgent(client, profile)
     out_dir = storage.job_build_dir(job.id)
     result = GenerateResult(job, out_dir, [])
 
-    steps = (("resume", lambda: ResumeTailor(client, profile).tailor(job, fit)),
-             ("cover_letter", lambda: CoverLetterWriter(client, profile).write(job, fit)))
-    for i, (kind, make) in enumerate(steps, start=1):
-        if progress:
-            progress(i, len(steps), kind.replace("_", " "))
-        final, report = critic.refine(make(), job, kind, max_rounds=rounds)
+    def write(kind: str) -> tuple[str, Any]:
+        draft = (ResumeTailor(client, profile).tailor(job, fit) if kind == "resume"
+                 else CoverLetterWriter(client, profile).write(job, fit))
+        return critic.refine(draft, job, kind, max_rounds=rounds, recheck_with_llm=recheck)
+
+    # Resume and cover letter are independent: write them at the same time.
+    if progress:
+        progress(1, 2, "resume and cover letter")
+    kinds = ("resume", "cover_letter")
+    with ThreadPoolExecutor(max_workers=2 if gen_cfg.get("parallel", True) else 1) as pool:
+        outcomes = dict(zip(kinds, pool.map(write, kinds)))
+    for kind in kinds:
+        final, report = outcomes[kind]
         result.reports[kind] = {"passed": report.passed, "issues": report.issues,
                                 "hallucinations": report.hallucinations}
         result.files += export_documents(final, out_dir / kind, formats)
+    result.bundle = bundle_application(out_dir, profile.get("name", ""), job.company)
 
     (out_dir / "critic_report.json").write_text(json.dumps(result.reports, indent=2), encoding="utf-8")
     (out_dir / "job.json").write_text(json.dumps(job.to_dict(), indent=2, ensure_ascii=False),
                                       encoding="utf-8")
     return result
+
+
+def bundle_application(out_dir: Path, name: str, company: str) -> Path:
+    """One download with both documents, as PDF and Word, named for the application."""
+    def slug(text: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "_", text or "").strip("_")[:40]
+
+    stem = "_".join(x for x in (slug(name), slug(company)) if x) or "application"
+    path = out_dir / "application.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for kind, label in (("resume", "Resume"), ("cover_letter", "Cover_Letter")):
+            for ext in ("pdf", "docx"):
+                src = out_dir / f"{kind}.{ext}"
+                if src.exists():
+                    zf.write(src, f"{stem}_{label}.{ext}")
+    return path

@@ -52,6 +52,8 @@ def cmd_hunt(args: argparse.Namespace, settings: dict[str, Any], storage: Storag
     print(f"\nDone in {sm.seconds:.0f}s: {p.found} found, {p.filtered} filtered, "
           f"{p.not_relevant} not relevant, {p.scored} scored, {p.apply} good matches"
           + (f", {sm.unscored_left} left for `rank`" if sm.unscored_left else ""))
+    if sm.ai_speed:
+        print(f"AI speed: {sm.ai_speed}")
     for label in p.failed_queries:
         print(f"  search failed: {label}")
     _print_rankings(storage, show_all=False)

@@ -28,7 +28,7 @@ B.A. Communications, Colorado State University, 2018
 
 
 class AppLLM(ScriptedLLM):
-    def chat(self, system, user, *, json_mode=False, temperature=None):
+    def chat(self, system, user, *, json_mode=False, temperature=None, max_tokens=None):
         if "resume into a structured json profile" in system.lower():
             return json.dumps({
                 "name": "Sam Rivera", "email": "sam@example.com", "location": "Denver, CO",
@@ -41,6 +41,8 @@ class AppLLM(ScriptedLLM):
                 "education": [{"school": "Colorado State University", "degree": "B.A. Communications",
                                "year": 2018}],
             })
+        if "fast first pass" in system.lower():
+            return json.dumps({"skills": 5, "experience": 4, "missing": ["Medical billing"]})
         if "fit_score" in system.lower():
             return json.dumps({"fit_score": 82, "matched_skills": ["Scheduling", "QuickBooks"],
                                "skill_gaps": ["Medical billing"], "recommendation": "Apply",
@@ -81,7 +83,7 @@ def app_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ollama_admin, "pull_model", fake_pull)
     llm = AppLLM()
-    monkeypatch.setattr(core.llm_client, "build_client", lambda s, provider=None: llm)
+    monkeypatch.setattr(core.llm_client, "build_client", lambda s, provider=None, purpose="general": llm)
     MANAGER._tasks.clear()
     yield tmp_path, llm
     MANAGER.wait()
@@ -134,6 +136,7 @@ def test_full_flow(app_env):
     remove = [b for b in at.button if b.label == "Remove this job"]
     remove[1].click().run()
     assert not at.exception
+    at.text_input(key="p3_titles").input("Office Manager").run()
     _button(at, "Save my profile").click().run()
     assert not at.exception
     profile = yaml.safe_load((tmp_path / "my_profile.yaml").read_text())
@@ -161,14 +164,20 @@ def test_full_flow(app_env):
     # Matches: already scored, with "why you fit" notes; then generate documents.
     at = _page("ranked").run()
     assert not at.exception, at.exception
-    assert at.metric[0].value == "82"
-    why = next(m.value for m in at.markdown if "Why you fit" in m.value)
+    assert int(at.metric[0].value) >= 65                          # recommended
+    assert any("Skills 5/5 · Experience 4/5 · Title match" in c.value for c in at.caption)
+    why = next(m.value for m in at.markdown if "Why you fit" in m.value)   # top match auto-explained
     assert "Patient scheduling" in why and "Bluebird Dental" in why
     assert "500 clinics" not in why                               # invented evidence dropped
     _finish(_button(at, "Create resume & cover letter").click().run())
     assert not at.exception, at.exception
     labels = [d.label for d in at.get("download_button")]
-    assert labels.count("Download PDF") == 2 and labels.count("Download DOCX") == 2
+    assert labels[0] == "⬇️ Download resume + cover letter (PDF and Word)"      # one download for both
+    assert labels.count("PDF") == 2 and labels.count("DOCX") == 2               # and separately
+    import zipfile
+    names = zipfile.ZipFile(next((tmp_path / "build").iterdir()) / "application.zip").namelist()
+    assert sorted(names) == ["Sam_Rivera_Smile_Clinic_Cover_Letter.docx", "Sam_Rivera_Smile_Clinic_Cover_Letter.pdf",
+                             "Sam_Rivera_Smile_Clinic_Resume.docx", "Sam_Rivera_Smile_Clinic_Resume.pdf"]
     build = next((tmp_path / "build").iterdir())
     resume = (build / "resume.md").read_text()
     assert resume.startswith("# Sam Rivera") and "Invented Corp" not in resume
@@ -188,7 +197,7 @@ def test_task_keeps_running_when_user_clicks_elsewhere(app_env):
     storage_jobs = tmp_path / "data" / "jobs.jsonl"
     storage_jobs.parent.mkdir(parents=True)
     storage_jobs.write_text(json.dumps({
-        "id": "job1", "title": "Office Manager", "company": "Smile Clinic", "location": "Denver, CO",
+        "id": "job1", "title": "Backend Engineer", "company": "Northwind", "location": "Austin, TX",
         "description": "Office manager for scheduling and QuickBooks bookkeeping at a dental clinic."}) + "\n")
 
     at = _page("ranked").run()
@@ -207,8 +216,9 @@ def test_task_keeps_running_when_user_clicks_elsewhere(app_env):
     _finish(at)
     assert not at.exception, at.exception
     assert MANAGER.get("rank").status == "done"
-    assert json.loads((tmp_path / "data" / "rankings.json").read_text())[0]["fit_score"] == 82
-    assert at.metric[0].value == "82"
+    ranked = json.loads((tmp_path / "data" / "rankings.json").read_text())
+    assert ranked[0]["recommendation"] == "Apply" and ranked[0]["ratings"] == {"skills": 5, "experience": 4}
+    assert at.metric[0].value == str(ranked[0]["fit_score"])
 
 
 def test_search_and_rank_runs_in_one_step(app_env, monkeypatch):
@@ -243,4 +253,18 @@ def test_search_and_rank_runs_in_one_step(app_env, monkeypatch):
     assert "doesn't mention your job titles or skills" in skipped.markdown[0].value
 
     at = _page("ranked").run()
-    assert [m.value for m in at.metric] == ["82", "82", "82"]
+    scores = [int(m.value) for m in at.metric]
+    assert len(scores) == 3 and all(x >= 65 for x in scores)
+
+    # "Not interested" removes one; "Clear list" removes the rest; neither comes back.
+    next(b for b in at.button if b.label == "Not interested").click().run()
+    assert not at.exception, at.exception
+    assert len(at.metric) == 2
+    _button(at, "Yes, clear the list").click().run()
+    assert not at.exception, at.exception
+    assert any("No jobs yet" in i.value for i in at.info)
+
+    at = _page("find").run()
+    _finish(_button(at, "Search and rank").click().run())
+    summary = next(s.value for s in at.success if "listings found" in s.value)
+    assert "scored **0**" in summary                              # nothing old is re-scored

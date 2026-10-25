@@ -21,8 +21,8 @@ JOB_SITES = ["indeed", "linkedin", "glassdoor", "zip_recruiter", "google"]
 DOC_LABELS = {"resume": "Resume", "cover_letter": "Cover letter"}
 
 
-def build_client(s: dict[str, Any]):
-    return llm_client.build_client(s)
+def build_client(s: dict[str, Any], purpose: str = "general"):
+    return llm_client.build_client(s, purpose=purpose)
 
 
 # ---------------------------------------------------------------- helpers
@@ -194,6 +194,9 @@ def page_setup() -> None:
                     save_user_overrides({"llm": {"provider": "ollama", "ollama": {"model": pick}}})
                     st.rerun()
 
+    if running and ollama_admin.has_model(base, model):
+        _fast_scoring_option(s, base, model)
+
     st.subheader("Step 3 · Your resume")
     if has_user_profile(s):
         st.success(f"Profile saved for **{load_profile(s).get('name') or 'you'}**.")
@@ -202,14 +205,44 @@ def page_setup() -> None:
     st.page_link(PAGES["profile"], label="Go to My profile", icon="👤")
 
 
-def _pull(task: Task, base: str, model: str) -> None:
+def _pull(task: Task, base: str, model: str, role: str = "model") -> None:
+    """Download a model; role "model" makes it the main model, "scoring_model" the quick-rating one."""
     for ev in ollama_admin.pull_model(base, model):
         done, total = ev.get("completed"), ev.get("total")
         if done and total:
             task.update(done / total, f"{ev['status']} · {done / 1e9:.1f} of {total / 1e9:.1f} GB")
         else:
             task.update(None, ev.get("status", ""))
-    save_user_overrides({"llm": {"provider": "ollama", "ollama": {"model": model}}})
+    save_user_overrides({"llm": {"provider": "ollama", "ollama": {role: model}}})
+
+
+FAST_MODEL = "qwen2.5:3b-instruct"
+
+
+def _fast_scoring_option(s: dict[str, Any], base: str, model: str) -> None:
+    if model == FAST_MODEL:
+        return
+    current = s.get("llm", {}).get("ollama", {}).get("scoring_model") or ""
+    with st.expander("Optional · Faster job scoring"):
+        st.write(f"Use the small model ({MODEL_SIZES[FAST_MODEL]} download) for the quick first-pass "
+                 "ratings: roughly twice as fast. Explanations, resumes and cover letters still use "
+                 f"**{model}**.")
+        pulling = MANAGER.get("pull_fast")
+        if pulling and pulling.running:
+            task_progress("pull_fast")
+            return
+        on = st.toggle("Use the small model for quick ratings", value=bool(current))
+        if on and not current:
+            if ollama_admin.has_model(base, FAST_MODEL):
+                save_user_overrides({"llm": {"ollama": {"scoring_model": FAST_MODEL}}})
+                st.rerun()
+            elif st.button("Download the small model", disabled=bool(busy_reason()), help=busy_reason()):
+                start_task("pull_fast", f"Downloading {FAST_MODEL}",
+                           lambda t: _pull(t, base, FAST_MODEL, role="scoring_model"))
+        elif not on and current:
+            save_user_overrides({"llm": {"ollama": {"scoring_model": ""}}})
+            st.rerun()
+        task_error("pull_fast")
 
 
 # ---------------------------------------------------------------- profile
@@ -284,7 +317,14 @@ def page_profile() -> None:
     min_salary = c1.number_input("Minimum yearly salary (0 = any)", min_value=0, step=5000,
                                  value=int(t["min_salary"] or 0), key=k("min_salary"))
     remote_ok = c2.checkbox("Open to remote work", bool(t["remote_ok"]), key=k("remote_ok"))
-    cur["target"] = {"titles": commas(titles), "min_salary": int(min_salary) or None, "remote_ok": remote_ok}
+    c1, c2 = st.columns(2)
+    commute = c1.number_input("How far will you travel to work? (miles)", min_value=1, max_value=500,
+                              value=int(t.get("commute_miles") or 25), key=k("commute"))
+    prefer_local = c2.checkbox("Rank small local employers higher", bool(t.get("prefer_local", True)),
+                               key=k("prefer_local"),
+                               help="Small businesses near you often favour people who live in the area.")
+    cur["target"] = {"titles": commas(titles), "min_salary": int(min_salary) or None, "remote_ok": remote_ok,
+                     "commute_miles": int(commute), "prefer_local": prefer_local}
 
     st.subheader("Skills")
     st.caption("Comma separated. Use whichever boxes fit your field; leave the rest empty.")
@@ -452,7 +492,10 @@ def page_find() -> None:
 
 
 def _hunt(task: Task, settings: dict[str, Any], client, *, new_jobs=None, search: bool = True):
+    scoring = build_client(settings, purpose="scoring")
+    same = getattr(scoring, "model", None) == getattr(client, "model", None)
     return pipeline.hunt(settings, Storage(settings), client, new_jobs=new_jobs, search=search,
+                         scoring_client=None if same else scoring,
                          on_progress=lambda p: task.update(p.fraction, p.message))
 
 
@@ -501,10 +544,13 @@ def _show_hunt_summary(sm, task: Task) -> None:
         removed = p.filtered + p.not_relevant
         if removed:
             lines_.append(f"Skipped **{removed}** that didn't fit your filters or profile.")
-        lines_.append(f"The AI scored **{p.scored}** job(s): **{p.apply}** good match(es).")
+        lines_.append(f"The AI scored **{p.scored}** job(s): **{p.apply}** good match(es)"
+                      + (f", and explained the top {p.explained}." if p.explained else "."))
         st.success("  \n".join(lines_))
         if p.apply:
             st.page_link(PAGES["ranked"], label="See your matches", icon="⭐")
+    if sm.ai_speed:
+        st.caption(f"AI speed on this computer: {sm.ai_speed}")
     if sm.unscored_left:
         st.info(f"{sm.unscored_left} more relevant job(s) are waiting. Score them on **Your matches**.")
     if p.failed_queries:
@@ -546,7 +592,14 @@ def page_ranked() -> None:
             start_task("rank", f"Scoring {n} job(s)", lambda t: _hunt(t, s, client, search=False))
     task_error("rank")
 
-    show_skip = st.toggle("Also show jobs the AI suggests skipping")
+    c1, c2 = st.columns([3, 1])
+    show_skip = c1.toggle("Also show jobs the AI suggests skipping")
+    with c2.popover("Clear list", disabled=bool(live), use_container_width=True):
+        st.write(f"Remove all **{total}** job(s) from your list? They won't be shown or scored again in "
+                 "future searches. Resumes you already created are kept.")
+        if st.button("Yes, clear the list", type="primary"):
+            storage.hide({j.id for j in storage.load_jobs()})
+            st.rerun()
     if live:
         _live_match_list(show_skip)       # refreshes itself as each job is scored
     else:
@@ -568,13 +621,38 @@ def _live_match_list(show_skip: bool) -> None:
     _match_list(s, Storage(s), show_skip)
 
 
+SCORE_PART_LABELS = {"skills": "Skills", "experience": "Experience", "title": "Job title match",
+                     "location": "Distance from home", "local": "Small local employer"}
+
+
+def _score_line(fit) -> str:
+    bits = []
+    if fit.ratings:
+        bits.append(f"Skills {fit.ratings.get('skills', '?')}/5")
+        bits.append(f"Experience {fit.ratings.get('experience', '?')}/5")
+    if fit.score_points.get("title", 0) >= 10:
+        bits.append("Title match")
+    bits += [_md(x) for x in fit.labels]
+    return " · ".join(bits)
+
+
 def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
     with st.container(border=True):
-        c1, c2 = st.columns([1, 5])
+        c1, c2, c3 = st.columns([1, 5, 1.3])
         c1.metric("Fit", fit.fit_score)
         c2.markdown(f"**{_md(job.title)}**  \n{_md(job.company)} · {_md(job.location) or 'Location not listed'}")
         if job.url:
             c2.markdown(f"[Open the posting]({job.url.replace('(', '%28').replace(')', '%29')})")
+        if c3.button("Not interested", key=f"hide_{job.id}", help="Remove it and never show it again"):
+            storage.hide({job.id})
+            st.rerun()
+        line = _score_line(fit)
+        if line:
+            st.caption(line)
+        if fit.score_points:
+            with st.expander("How this score was worked out"):
+                st.markdown("  \n".join(f"{SCORE_PART_LABELS.get(k, k)}: **{v:g}** points"
+                                         for k, v in fit.score_points.items()))
         if fit.rationale:
             st.caption(_md(fit.rationale))
         if fit.fit_highlights:
@@ -585,36 +663,58 @@ def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
         if fit.skill_gaps:
             st.markdown("➖ **They also want:** " + ", ".join(_md(x) for x in fit.skill_gaps))
 
+        explain_key = f"explain:{job.id}"
+        explaining = MANAGER.get(explain_key)
         out_dir = storage.build_dir / job.id
         key = f"generate:{job.id}"
         writing = MANAGER.get(key)
-        label = "Create again" if (out_dir / "resume.pdf").exists() else "Create resume & cover letter"
+        if explaining and explaining.running:
+            task_progress(explain_key)
         if writing and writing.running:
             task_progress(key)
-        elif st.button(label, key=f"gen_{job.id}", type="primary" if fit.recommendation == "Apply" else "secondary",
-                       disabled=bool(busy_reason()), help=busy_reason()):
-            client = build_client(s)
-            start_task(key, f"Writing documents for {job.title} at {job.company}", lambda t: pipeline.generate(
-                s, storage, client, job.id, force=True,
-                progress=lambda i, n, what: t.update((i - 1) / n, f"Writing the {what} and checking it...")))
+        else:
+            b1, b2 = st.columns(2)
+            label = "Create again" if (out_dir / "application.zip").exists() else "Create resume & cover letter"
+            if b1.button(label, key=f"gen_{job.id}", type="primary" if fit.recommendation == "Apply" else "secondary",
+                         disabled=bool(busy_reason()), help=busy_reason(), use_container_width=True):
+                client = build_client(s)
+                start_task(key, f"Writing documents for {job.title} at {job.company}", lambda t: pipeline.generate(
+                    s, storage, client, job.id, force=True,
+                    progress=lambda i, n, what: t.update(None, f"Writing the {what} at the same time...")))
+            if not fit.explained and not (explaining and explaining.running) and b2.button(
+                    "Explain this match", key=f"explain_{job.id}", disabled=bool(busy_reason()),
+                    help=busy_reason() or "Have the AI write out why you fit (about a minute)",
+                    use_container_width=True):
+                client = build_client(s)
+                start_task(explain_key, f"Explaining {job.title} at {job.company}",
+                           lambda t: pipeline.explain(s, storage, client, job.id))
+        task_error(explain_key)
         task_error(key)
         if not (writing and writing.running):
-            _downloads(out_dir)
+            _downloads(out_dir, job)
 
 
-def _downloads(out_dir: Path) -> None:
+def _downloads(out_dir: Path, job) -> None:
     report_path = out_dir / "critic_report.json"
+    bundle = out_dir / "application.zip"
     if not report_path.exists():
         return
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    if bundle.exists():
+        st.download_button("⬇️ Download resume + cover letter (PDF and Word)", bundle.read_bytes(),
+                           file_name=f"Application_{''.join(c for c in job.company if c.isalnum())[:30] or 'job'}.zip",
+                           mime="application/zip", key=f"dl_{out_dir.name}_bundle", type="primary")
+    with st.expander("Download one file at a time"):
+        for kind, label in DOC_LABELS.items():
+            cols = st.columns(3)
+            cols[0].write(f"**{label}**")
+            for col, ext in zip(cols[1:], ("pdf", "docx")):
+                path = out_dir / f"{kind}.{ext}"
+                if path.exists():
+                    col.download_button(f"{ext.upper()}", path.read_bytes(),
+                                        file_name=f"{label.replace(' ', '_')}.{ext}",
+                                        key=f"dl_{out_dir.name}_{path.name}")
     for kind, label in DOC_LABELS.items():
-        files = [out_dir / f"{kind}.{ext}" for ext in ("pdf", "docx")]
-        cols = st.columns(3)
-        cols[0].write(f"**{label}**")
-        for col, path in zip(cols[1:], files):
-            if path.exists():
-                col.download_button(f"Download {path.suffix[1:].upper()}", path.read_bytes(), file_name=
-                                    f"{label.replace(' ', '_')}{path.suffix}", key=f"dl_{out_dir.name}_{path.name}")
         rep = report.get(kind, {})
         problems = rep.get("hallucinations", []) + rep.get("issues", [])
         if problems:

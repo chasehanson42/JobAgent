@@ -235,7 +235,9 @@ class CriticAgent:
         return revised if revised.strip() else document_md
 
     def refine(self, document_md: str, job: Job, kind: Kind,
-               max_rounds: int = 2) -> tuple[str, CriticReport]:
+               max_rounds: int = 2, recheck_with_llm: bool = True) -> tuple[str, CriticReport]:
+        """Review -> revise loop. With recheck_with_llm=False a revision is re-checked by the
+        instant deterministic checks only, saving one slow AI review per round."""
         current = document_md
         current_det = self.deterministic_checks(current, kind)
         report = self.review(current, job, kind)
@@ -249,5 +251,5 @@ class CriticAgent:
                          cand_det.problem_count, current_det.problem_count)
                 break
             current, current_det = candidate, cand_det
-            report = self.review(current, job, kind)
+            report = self.review(current, job, kind) if recheck_with_llm else cand_det
         return current, report

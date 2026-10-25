@@ -37,9 +37,11 @@ class FakeLLM:
         self.delay, self.fail_with = delay, fail_with
         self.lock = threading.Lock()
         self.active = self.max_active = 0
-        self.order = []
+        self.order = []          # quick ratings, in the order they ran
+        self.explained = []      # detailed "why you fit" calls
+        self.max_tokens = []
 
-    def chat(self, system, user, *, json_mode=False, temperature=None):
+    def chat(self, system, user, *, json_mode=False, temperature=None, max_tokens=None):
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -49,9 +51,16 @@ class FakeLLM:
                 raise self.fail_with
             meta = user.split("<untrusted_job_metadata", 1)[1]
             title = meta.split("title: ", 1)[1].split("\n", 1)[0]
+            good = "Office Manager" in title
+            if "fast first pass" in system:
+                with self.lock:
+                    self.order.append(title)
+                    self.max_tokens.append(max_tokens)
+                return json.dumps({"skills": 5 if good else 3, "experience": 5 if good else 3,
+                                   "missing": [] if good else ["Medical billing"]})
             with self.lock:
-                self.order.append(title)
-            score = 90 if "Office Manager" in title else 50
+                self.explained.append(title)
+            score = 90 if good else 50
             return json.dumps({
                 "fit_score": score, "matched_skills": ["Scheduling"], "skill_gaps": [],
                 "recommendation": "Apply" if score >= 65 else "Skip", "rationale": "ok",
@@ -210,3 +219,93 @@ def test_progress_reaches_the_end(env):
                  on_progress=seen.append, sleep=lambda s: None).run(queries(terms=("x",)))
     assert seen[-1].fraction == pytest.approx(1.0)
     assert "Searched 3 of 3" in seen[-1].message and "scored 3 of 3" in seen[-1].message
+
+
+def test_quick_pass_first_then_explain_only_the_top_matches(env):
+    settings, storage = env
+    settings["ranking"]["explain_top"] = 2
+    settings["parallel"]["llm_workers"] = 1
+    llm = FakeLLM()
+    found = [job(f"Office Manager {i}") for i in range(5)] + [job("Receptionist")]
+    summary = HuntPipeline(settings, storage, llm, query_fn=lambda q: found,
+                           sleep=lambda s: None).run([SearchQuery("indeed", "x")])
+    assert len(llm.order) == 6 and all(t and t <= 100 for t in llm.max_tokens)   # short answers
+    assert len(llm.explained) == 2                                               # only the top 2
+    assert summary.progress.explained == 2 and summary.progress.apply == 5
+    ranked = {r.job_id: r for r in storage.load_rankings()}
+    explained = [r for r in ranked.values() if r.explained]
+    assert len(explained) == 2 and all(r.fit_highlights for r in explained)
+    assert all(r.ratings and r.score_points for r in ranked.values())
+
+
+def test_explanations_wait_for_all_quick_scores(env):
+    settings, storage = env
+    settings["parallel"]["llm_workers"] = 1
+    calls = []
+    llm = FakeLLM()
+    real = llm.chat
+
+    def spy(system, user, **kw):
+        calls.append("quick" if "fast first pass" in system else "explain")
+        return real(system, user, **kw)
+
+    llm.chat = spy
+    found = [job(f"Office Manager {i}") for i in range(4)]
+    HuntPipeline(settings, storage, llm, query_fn=lambda q: found,
+                 sleep=lambda s: None).run([SearchQuery("indeed", "x")])
+    assert calls[:4] == ["quick"] * 4 and set(calls[4:]) == {"explain"}
+
+
+def test_dismissed_jobs_are_never_scored_again(env):
+    settings, storage = env
+    found = [job("Office Manager A"), job("Office Manager B")]
+    HuntPipeline(settings, storage, FakeLLM(), query_fn=lambda q: found,
+                 sleep=lambda s: None).run([SearchQuery("indeed", "x")])
+    storage.hide({found[0].id})
+    assert {j.id for j in storage.load_jobs()} == {found[1].id}
+    assert {r.job_id for r in storage.load_rankings()} == {found[1].id}
+
+    llm = FakeLLM()
+    summary = HuntPipeline(settings, storage, llm, query_fn=lambda q: found,
+                           sleep=lambda s: None).run([SearchQuery("indeed", "x")])
+    assert llm.order == [] and summary.progress.scored == 0
+    assert found[0].id not in {j.id for j in storage.load_jobs()}
+
+
+def test_resume_and_cover_letter_are_written_at_the_same_time(env):
+    from core import pipeline
+
+    settings, storage = env
+    target = job("Office Manager", company="Smile Clinic")
+    storage.save_jobs([target])
+    lock = threading.Lock()
+    state = {"active": 0, "max": 0, "calls": 0}
+
+    class DocLLM:
+        name, model = "fake", "fake"
+
+        def chat(self, system, user, *, json_mode=False, temperature=None, max_tokens=None):
+            with lock:
+                state["active"] += 1
+                state["calls"] += 1
+                state["max"] = max(state["max"], state["active"])
+            try:
+                time.sleep(0.2)
+                if "hallucinations" in system.lower():
+                    return json.dumps({"hallucinations": [], "issues": []})
+                if json_mode:
+                    return json.dumps({"summary": "Office manager for busy clinics.",
+                                       "skills": ["Scheduling"],
+                                       "experience": [{"company": "Bluebird Dental", "bullets": [
+                                           "Scheduled 40 patients per day across 3 dentists"]}]})
+                return "I run busy clinic offices.\n\nAt Bluebird Dental I scheduled patients.\n\nI'd love to talk."
+            finally:
+                with lock:
+                    state["active"] -= 1
+
+    t0 = time.time()
+    result = pipeline.generate(settings, storage, DocLLM(), target.id, force=True)
+    assert state["max"] == 2                       # both documents in flight together
+    assert state["calls"] <= 4                     # draft + one review each, no extra rounds
+    assert time.time() - t0 < 4 * 0.2 + 0.5
+    assert result.bundle and result.bundle.exists()

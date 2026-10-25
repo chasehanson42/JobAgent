@@ -23,7 +23,7 @@ class FakeLLMClient:
         self.responses = list(responses)
         self.calls = []
 
-    def chat(self, system, user, *, json_mode=False, temperature=None):
+    def chat(self, system, user, *, json_mode=False, temperature=None, max_tokens=None):
         self.calls.append({"system": system, "user": user, "json_mode": json_mode,
                            "temperature": temperature})
         if not self.responses:
@@ -269,7 +269,7 @@ def test_evaluator_is_thread_safe():
     from concurrent.futures import ThreadPoolExecutor
 
     class SlowClient(FakeLLMClient):
-        def chat(self, system, user, *, json_mode=False, temperature=None):
+        def chat(self, system, user, *, json_mode=False, temperature=None, max_tokens=None):
             score = 50 + int(user.split("title: Job ")[1].split("\n")[0])
             return payload(fit_score=score, fit_highlights=[GOOD_HL])
 

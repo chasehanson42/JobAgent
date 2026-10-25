@@ -18,9 +18,11 @@ class ScriptedLLM:
     def __init__(self):
         self.calls = []
 
-    def chat(self, system, user, *, json_mode=False, temperature=None):
+    def chat(self, system, user, *, json_mode=False, temperature=None, max_tokens=None):
         self.calls.append((system, user))
         s = system.lower()
+        if "fast first pass" in s:
+            return json.dumps({"skills": 5, "experience": 4, "missing": ["Rust"]})
         if "fit_score" in s:
             return json.dumps({"fit_score": 88, "matched_skills": ["Python", "FastAPI", "Cobol"],
                                "skill_gaps": ["Rust"], "recommendation": "Apply",
