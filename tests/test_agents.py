@@ -309,3 +309,44 @@ def test_resume_and_cover_letter_are_written_at_the_same_time(env):
     assert state["calls"] <= 4                     # draft + one review each, no extra rounds
     assert time.time() - t0 < 4 * 0.2 + 0.5
     assert result.bundle and result.bundle.exists()
+
+
+def test_real_ollama_client_end_to_end_with_speed_summary(env):
+    """Regression: the summary crashed on the real (dataclass) client, which fakes didn't catch."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from core.llm_client import OllamaClient
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            quick = "fast first pass" in body["messages"][0]["content"]
+            content = (json.dumps({"skills": 4, "experience": 4, "missing": []}) if quick else
+                       json.dumps({"fit_score": 80, "matched_skills": [], "skill_gaps": [],
+                                   "recommendation": "Apply", "rationale": "ok", "fit_highlights": []}))
+            data = json.dumps({"message": {"content": content}, "prompt_eval_count": 400,
+                               "prompt_eval_duration": 2e9, "eval_count": 30,
+                               "eval_duration": 1e9}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        settings, storage = env
+        main = OllamaClient(base_url=f"http://127.0.0.1:{server.server_port}")
+        fast = OllamaClient(base_url=f"http://127.0.0.1:{server.server_port}", model="small")
+        found = [job("Office Manager"), job("Office Manager 2")]
+        for scoring in (None, fast):
+            summary = HuntPipeline(settings, storage, main, scoring_client=scoring, query_fn=lambda q: found,
+                                   sleep=lambda s: None).run([SearchQuery("indeed", "x")], score_stored=False)
+            assert "reading 200 words/s, writing 30.0 words/s" in summary.ai_speed
+            storage.hide({j.id for j in found})
+            found = [job(f"Office Manager {x}") for x in "AB"]
+    finally:
+        server.shutdown()

@@ -200,8 +200,8 @@ class HuntPipeline:
         if self._fatal is not None:
             raise self._fatal
         unscored = self._leftover + sum(1 for _, _, kind, _ in list(self._queue.queue) if kind == "score")
-        speed = " · ".join(filter(None, (getattr(c, "stats", None) and c.stats.summary()
-                                         for c in dict.fromkeys(self.clients))))
+        speed = " · ".join(filter(None, (c.stats.summary() for c in self._distinct_clients()
+                                         if getattr(c, "stats", None))))
         return HuntSummary(replace(self.progress), list(self._results), list(self._dropped),
                            unscored, self._injection, time.time() - t0, speed)
 
@@ -355,6 +355,14 @@ class HuntPipeline:
 
 
     # ---------------------------------------------------------------- helpers
+
+    def _distinct_clients(self) -> list[LLMClient]:
+        # By identity: clients are dataclasses, so they can't be dict keys or set members.
+        out: list[LLMClient] = []
+        for c in self.clients:
+            if not any(c is o for o in out):
+                out.append(c)
+        return out
 
     def _report(self) -> None:
         if self.on_progress is None:
