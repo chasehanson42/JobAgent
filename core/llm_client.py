@@ -89,7 +89,7 @@ def _with_retries(fn, retries: int):
     raise LLMError(f"LLM call failed after {retries + 1} attempts: {last}")
 
 
-@dataclass
+@dataclass(eq=False)  # compared/hashed by identity, so clients can be dict keys
 class OllamaClient:
     base_url: str = "http://localhost:11434"
     model: str = "qwen2.5:7b-instruct"
@@ -126,7 +126,7 @@ class OllamaClient:
             raise LLMError(f"Unexpected Ollama response: {str(data)[:300]}") from exc
 
 
-@dataclass
+@dataclass(eq=False)
 class GeminiFreeTierClient:
     """Gemini via its OpenAI-compatible endpoint (free developer tier)."""
     api_key: str

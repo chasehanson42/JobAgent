@@ -16,4 +16,5 @@ st.set_page_config(page_title="JobAgent", page_icon="💼", layout="centered")
 nav = st.navigation(webapp.make_pages())
 with st.sidebar:
     webapp.sidebar_status()
+    st.caption(f"JobAgent version {webapp.APP_VERSION}")
 nav.run()

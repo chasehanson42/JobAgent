@@ -7,7 +7,7 @@ from typing import Any
 
 import streamlit as st
 
-from core import llm_client, ollama_admin, pipeline
+from core import __version__ as APP_VERSION, llm_client, ollama_admin, pipeline
 from core.background import MANAGER, Task, TaskBusy
 from core.settings import (has_user_profile, load_profile, load_settings, load_user_overrides,
                            save_profile, save_user_overrides)
