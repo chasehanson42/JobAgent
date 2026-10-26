@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,19 @@ from core.storage import Storage
 from scrapers.job_scraper import jobspy_available
 from importers.resume_importer import (ResumeImportError, draft_profile, empty_profile,
                                        extract_text, validate_profile)
+
+def _record_server() -> None:
+    """Note which version this server process runs, so the launcher can replace a stale one."""
+    try:
+        from core.settings import PROJECT_ROOT
+        path = PROJECT_ROOT / "data" / "server.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"pid": os.getpid(), "version": APP_VERSION}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_record_server()
 
 MODEL_SIZES = {"qwen2.5:7b-instruct": "4.7 GB", "qwen2.5:3b-instruct": "1.9 GB"}
 JOB_SITES = ["indeed", "linkedin", "glassdoor", "zip_recruiter", "google"]
