@@ -26,6 +26,7 @@ class Job:
     salary_currency: str | None = None
     salary_interval: str | None = None   # yearly, monthly, hourly ...
     date_posted: str | None = None
+    company_employees: str | None = None  # e.g. "11 to 50", when the job site lists it
     scraped_at: str = ""
     # Set by the sanitizer: names of injection/malware patterns that were removed.
     sanitizer_flags: list[str] = field(default_factory=list)
@@ -47,6 +48,14 @@ class FitResult:
     skill_gaps: list[str]
     recommendation: Literal["Apply", "Skip"]
     rationale: str = ""
+    # "Why you fit": [{"requirement": what the job asks, "evidence": matching profile fact}]
+    fit_highlights: list[dict[str, str]] = field(default_factory=list)
+    # Quick-pass breakdown: AI ratings (1-5), points per part of the score, and
+    # plain labels such as "12 mi from home" or "Small local employer".
+    ratings: dict[str, int] = field(default_factory=dict)
+    score_points: dict[str, float] = field(default_factory=dict)
+    labels: list[str] = field(default_factory=list)
+    explained: bool = False
     model: str = ""
     evaluated_at: str = ""
 

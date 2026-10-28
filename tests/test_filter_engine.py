@@ -131,3 +131,12 @@ def test_apply_splits_kept_and_dropped():
     kept, dropped = eng.apply([good, bad])
     assert kept == [good]
     assert len(dropped) == 1 and dropped[0][0] is bad and dropped[0][1]
+
+
+def test_title_and_company_rules_match_whole_words():
+    eng = FilterEngine({"title_blacklist": ["intern"], "company_blacklist": ["meta"]})
+    assert eng.evaluate(make_job(title="Internal Audit Manager")).keep
+    assert eng.evaluate(make_job(title="Office Manager", company="Metairie Bank")).keep
+    assert not eng.evaluate(make_job(title="Summer Intern")).keep
+    assert not eng.evaluate(make_job(title="Office Manager", company="Meta Platforms")).keep
+    assert FilterEngine({"title_blacklist": ["vp "]}).evaluate(make_job(title="VP Sales")).keep is False

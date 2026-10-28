@@ -1,0 +1,43 @@
+JOBAGENT - HOW TO START
+=======================
+
+JobAgent finds jobs, tells you which ones fit you, and writes a matching
+resume and cover letter. It runs on your own computer and is free.
+
+ONE-TIME SETUP (about 20 minutes, mostly waiting for downloads)
+--------------------------------------------------------------
+1. Install Python:  https://www.python.org/downloads/
+   Windows: on the FIRST screen of the installer, tick
+            "Add python.exe to PATH", then click "Install Now".
+
+2. Install Ollama (the free AI engine):  https://ollama.com/download
+
+3. Unzip the JobAgent folder somewhere easy, like your Documents folder.
+
+EVERY TIME YOU USE IT
+---------------------
+4. Open the JobAgent folder and double-click:
+     Windows:  Start JobAgent.bat
+     Mac:      Start JobAgent.command
+               (first time only: right-click it, choose Open, then Open again)
+
+   A black window appears. The very first time it sets things up for a few
+   minutes. Then JobAgent opens in your web browser.
+
+   KEEP THE BLACK WINDOW OPEN while you use JobAgent. Close it when you're done.
+
+5. In the browser, follow the pages on the left, top to bottom:
+     Setup        - download the AI model (one time)
+     My profile   - upload your resume, check what it filled in, click Save
+     Find jobs    - search job sites, or paste a job you found
+     Your matches - score the jobs, then "Create resume & cover letter"
+                    and download the PDF or Word file
+
+GOOD TO KNOW
+------------
+- Always read the resume and cover letter before sending them. If JobAgent
+  shows a "Please check" note, look at those lines first.
+- Your resume, profile and documents stay on your computer. Only job
+  searches go out to the job sites you pick.
+- If something goes wrong, take a screenshot of the black window and the
+  browser page and send it to whoever shared JobAgent with you.

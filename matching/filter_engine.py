@@ -1,6 +1,7 @@
 """Deterministic, zero-LLM job filtering driven by settings["filters"]."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -52,6 +53,15 @@ def _first_match(haystack: str, needles: Iterable[str]) -> str | None:
     return None
 
 
+def _first_word_match(haystack: str, needles: Iterable[str]) -> str | None:
+    """Whole-word match, so "intern" does not hit "Internal Audit Manager"."""
+    for needle in needles:
+        term = needle.strip()
+        if term and re.search(rf"(?<!\w){re.escape(term)}(?!\w)", haystack):
+            return needle
+    return None
+
+
 @dataclass
 class FilterDecision:
     keep: bool
@@ -97,14 +107,14 @@ class FilterEngine:
         if len(desc.strip()) < MIN_DESCRIPTION_CHARS:
             reasons.append("description_too_short")
 
-        hit = _first_match(title_l, self.title_blacklist)
+        hit = _first_word_match(title_l, self.title_blacklist)
         if hit:
             reasons.append(f"title_blacklist:{hit.strip()}")
 
-        if self.title_keywords_required and not _first_match(title_l, self.title_keywords_required):
+        if self.title_keywords_required and not _first_word_match(title_l, self.title_keywords_required):
             reasons.append("title_missing_required_keyword")
 
-        hit = _first_match(company_l, self.company_blacklist)
+        hit = _first_word_match(company_l, self.company_blacklist)
         if hit:
             reasons.append(f"company_blacklist:{hit.strip()}")
 

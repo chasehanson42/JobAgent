@@ -26,7 +26,7 @@ class FakeLLMClient:
         self.calls: list[dict] = []
 
     def chat(self, system: str, user: str, *, json_mode: bool = False,
-             temperature: float | None = None) -> str:
+             temperature: float | None = None, max_tokens: int | None = None) -> str:
         self.calls.append({"system": system, "user": user, "json_mode": json_mode})
         if not self.responses:
             raise AssertionError("FakeLLMClient ran out of canned responses")

@@ -6,13 +6,16 @@ so there is no SDK to install or pay for.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
@@ -20,11 +23,46 @@ class LLMError(RuntimeError):
     pass
 
 
+class LLMCancelled(LLMError):
+    """The user pressed Stop while this call was in progress."""
+
+
 class LLMClient(Protocol):
     name: str
 
     def chat(self, system: str, user: str, *, json_mode: bool = False,
-             temperature: float | None = None) -> str: ...
+             temperature: float | None = None, max_tokens: int | None = None) -> str: ...
+
+
+class CallStats:
+    """Where the AI's time goes: reading the prompt vs. writing the answer (Ollama reports both)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.prompt_seconds = 0.0
+        self.output_tokens = 0
+        self.output_seconds = 0.0
+        self.wall_seconds = 0.0
+
+    def add(self, data: dict[str, Any], wall: float) -> None:
+        with self._lock:
+            self.calls += 1
+            self.wall_seconds += wall
+            self.prompt_tokens += int(data.get("prompt_eval_count") or 0)
+            self.prompt_seconds += (data.get("prompt_eval_duration") or 0) / 1e9
+            self.output_tokens += int(data.get("eval_count") or 0)
+            self.output_seconds += (data.get("eval_duration") or 0) / 1e9
+
+    def summary(self) -> str:
+        if not self.calls:
+            return ""
+        parts = [f"{self.calls} AI call(s), {self.wall_seconds / self.calls:.0f}s each on average"]
+        if self.prompt_seconds and self.output_seconds:
+            parts.append(f"reading {self.prompt_tokens / self.prompt_seconds:.0f} words/s, "
+                         f"writing {self.output_tokens / self.output_seconds:.1f} words/s")
+        return " · ".join(parts)
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str],
@@ -40,6 +78,67 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str],
         raise LLMError(f"HTTP {exc.code} from {url}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise LLMError(f"Cannot reach {url}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise LLMError(f"Request to {url} timed out after {timeout:.0f}s") from exc
+
+
+class _Connections:
+    """Open HTTP connections, so a Stop button can cut off a call that is still running."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._open: list[http.client.HTTPConnection] = []
+        self.aborted = False
+
+    def add(self, conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            if self.aborted:
+                raise LLMCancelled("Stopped.")
+            self._open.append(conn)
+
+    def remove(self, conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            if conn in self._open:
+                self._open.remove(conn)
+
+    def abort(self) -> None:
+        with self._lock:
+            self.aborted = True
+            conns, self._open = self._open, []
+        for conn in conns:
+            try:
+                if conn.sock is not None:
+                    conn.sock.shutdown(socket.SHUT_RDWR)
+                conn.close()
+            except OSError:
+                pass
+
+
+def _post_json_local(url: str, payload: dict[str, Any], timeout: float, conns: _Connections) -> dict[str, Any]:
+    """POST to a local server (Ollama) on a connection that abort() can close mid-call."""
+    parts = urllib.parse.urlsplit(url)
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.hostname, parts.port, timeout=timeout)
+    conns.add(conn)
+    try:
+        conn.request("POST", parts.path or "/", body=json.dumps(payload).encode("utf-8"),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        if resp.status >= 400:
+            raise LLMError(f"HTTP {resp.status} from {url}: {raw[:500]}")
+        return json.loads(raw)
+    except LLMError:
+        raise
+    except TimeoutError as exc:
+        raise LLMError(f"Request to {url} timed out after {timeout:.0f}s") from exc
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        if conns.aborted:
+            raise LLMCancelled("Stopped.") from exc
+        raise LLMError(f"Cannot reach {url}: {exc}") from exc
+    finally:
+        conns.remove(conn)
+        conn.close()
 
 
 def _with_retries(fn, retries: int):
@@ -47,14 +146,18 @@ def _with_retries(fn, retries: int):
     for attempt in range(retries + 1):
         try:
             return fn()
+        except LLMCancelled:
+            raise
         except LLMError as exc:
             last = exc
+            if "timed out" in str(exc):
+                raise  # retrying a slow model just multiplies the wait
             if attempt < retries:
                 time.sleep(2 ** attempt)
     raise LLMError(f"LLM call failed after {retries + 1} attempts: {last}")
 
 
-@dataclass
+@dataclass(eq=False)  # compared/hashed by identity, so clients can be dict keys
 class OllamaClient:
     base_url: str = "http://localhost:11434"
     model: str = "qwen2.5:7b-instruct"
@@ -62,13 +165,21 @@ class OllamaClient:
     timeout: float = 180
     max_retries: int = 2
     num_ctx: int = 8192
+    keep_alive: str = "30m"
     name: str = "ollama"
+    stats: CallStats = field(default_factory=CallStats, repr=False, compare=False)
+    _conns: _Connections = field(default_factory=_Connections, repr=False, compare=False)
+
+    def abort(self) -> None:
+        """Cut off any call in progress; later calls on this client fail at once (Stop button)."""
+        self._conns.abort()
 
     def chat(self, system: str, user: str, *, json_mode: bool = False,
-             temperature: float | None = None) -> str:
+             temperature: float | None = None, max_tokens: int | None = None) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
+            "keep_alive": self.keep_alive,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "options": {"temperature": self.temperature if temperature is None else temperature,
@@ -76,15 +187,20 @@ class OllamaClient:
         }
         if json_mode:
             payload["format"] = "json"
+        if max_tokens:
+            payload["options"]["num_predict"] = max_tokens
         url = self.base_url.rstrip("/") + "/api/chat"
-        data = _with_retries(lambda: _post_json(url, payload, {}, self.timeout), self.max_retries)
+        t0 = time.monotonic()
+        data = _with_retries(lambda: _post_json_local(url, payload, self.timeout, self._conns),
+                             self.max_retries)
+        self.stats.add(data, time.monotonic() - t0)
         try:
             return data["message"]["content"]
         except (KeyError, TypeError) as exc:
             raise LLMError(f"Unexpected Ollama response: {str(data)[:300]}") from exc
 
 
-@dataclass
+@dataclass(eq=False)
 class GeminiFreeTierClient:
     """Gemini via its OpenAI-compatible endpoint (free developer tier)."""
     api_key: str
@@ -95,10 +211,15 @@ class GeminiFreeTierClient:
     max_retries: int = 2
     min_interval: float = 4.5
     name: str = "gemini"
+    stats: CallStats = field(default_factory=CallStats, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
         self._last_call = 0.0
+        self._aborted = False
+
+    def abort(self) -> None:
+        self._aborted = True
 
     def _throttle(self) -> None:
         # Stay within free-tier RPM limits so we never get pushed to billing.
@@ -109,7 +230,7 @@ class GeminiFreeTierClient:
             self._last_call = time.monotonic()
 
     def chat(self, system: str, user: str, *, json_mode: bool = False,
-             temperature: float | None = None) -> str:
+             temperature: float | None = None, max_tokens: int | None = None) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system},
@@ -118,22 +239,33 @@ class GeminiFreeTierClient:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
         url = self.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
         def call() -> dict[str, Any]:
+            if self._aborted:
+                raise LLMCancelled("Stopped.")
             self._throttle()
             return _post_json(url, payload, headers, self.timeout)
 
+        t0 = time.monotonic()
         data = _with_retries(call, self.max_retries)
+        self.stats.add({}, time.monotonic() - t0)
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"Unexpected Gemini response: {str(data)[:300]}") from exc
 
 
-def build_client(settings: dict[str, Any], provider: str | None = None) -> LLMClient:
-    """Create the configured client. `provider` overrides settings.yaml."""
+def build_client(settings: dict[str, Any], provider: str | None = None,
+                 purpose: str = "general") -> LLMClient:
+    """Create the configured client. `provider` overrides settings.yaml.
+
+    purpose="scoring" uses llm.ollama.scoring_model when one is set: a smaller,
+    faster model for the quick first-pass ratings.
+    """
     llm = settings.get("llm", {})
     provider = (provider or os.environ.get("FJA_LLM_PROVIDER") or llm.get("provider", "ollama")).lower()
     common = {
@@ -143,9 +275,13 @@ def build_client(settings: dict[str, Any], provider: str | None = None) -> LLMCl
     }
     if provider == "ollama":
         cfg = llm.get("ollama", {})
+        model = cfg.get("model", "qwen2.5:7b-instruct")
+        if purpose == "scoring" and cfg.get("scoring_model"):
+            model = cfg["scoring_model"]
         return OllamaClient(base_url=cfg.get("base_url", "http://localhost:11434"),
-                            model=cfg.get("model", "qwen2.5:7b-instruct"),
-                            num_ctx=int(cfg.get("num_ctx", 8192)), **common)
+                            model=model,
+                            num_ctx=int(cfg.get("num_ctx", 8192)),
+                            keep_alive=str(cfg.get("keep_alive", "30m")), **common)
     if provider == "gemini":
         cfg = llm.get("gemini", {})
         env = cfg.get("api_key_env", "GEMINI_API_KEY")
