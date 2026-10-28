@@ -47,3 +47,23 @@ def test_progress_is_clamped_and_clear_keeps_running_tasks():
     assert task.progress == 1.0
     mgr.clear("k")
     assert mgr.get("k") is None
+
+
+def test_stop_marks_task_stopped_runs_hooks_and_frees_the_app():
+    mgr = TaskManager()
+    gate = threading.Event()
+    hooks = []
+
+    def work(task):
+        task.on_stop(lambda: (hooks.append("abort"), gate.set()))
+        gate.wait(5)
+        if task.stop_requested:
+            raise RuntimeError("connection closed")   # what a cut-off AI call looks like
+        return "done"
+
+    task = mgr.start("k", "Work", work)
+    mgr.stop("k")
+    assert mgr.running() is None                      # can start something else right away
+    mgr.start("other", "Other", lambda t: "ok")
+    mgr.wait()
+    assert task.status == "stopped" and task.error is None and hooks == ["abort"]

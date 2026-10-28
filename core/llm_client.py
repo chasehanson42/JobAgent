@@ -6,11 +6,14 @@ so there is no SDK to install or pay for.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -18,6 +21,10 @@ from typing import Any, Protocol
 
 class LLMError(RuntimeError):
     pass
+
+
+class LLMCancelled(LLMError):
+    """The user pressed Stop while this call was in progress."""
 
 
 class LLMClient(Protocol):
@@ -75,11 +82,72 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str],
         raise LLMError(f"Request to {url} timed out after {timeout:.0f}s") from exc
 
 
+class _Connections:
+    """Open HTTP connections, so a Stop button can cut off a call that is still running."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._open: list[http.client.HTTPConnection] = []
+        self.aborted = False
+
+    def add(self, conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            if self.aborted:
+                raise LLMCancelled("Stopped.")
+            self._open.append(conn)
+
+    def remove(self, conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            if conn in self._open:
+                self._open.remove(conn)
+
+    def abort(self) -> None:
+        with self._lock:
+            self.aborted = True
+            conns, self._open = self._open, []
+        for conn in conns:
+            try:
+                if conn.sock is not None:
+                    conn.sock.shutdown(socket.SHUT_RDWR)
+                conn.close()
+            except OSError:
+                pass
+
+
+def _post_json_local(url: str, payload: dict[str, Any], timeout: float, conns: _Connections) -> dict[str, Any]:
+    """POST to a local server (Ollama) on a connection that abort() can close mid-call."""
+    parts = urllib.parse.urlsplit(url)
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.hostname, parts.port, timeout=timeout)
+    conns.add(conn)
+    try:
+        conn.request("POST", parts.path or "/", body=json.dumps(payload).encode("utf-8"),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        if resp.status >= 400:
+            raise LLMError(f"HTTP {resp.status} from {url}: {raw[:500]}")
+        return json.loads(raw)
+    except LLMError:
+        raise
+    except TimeoutError as exc:
+        raise LLMError(f"Request to {url} timed out after {timeout:.0f}s") from exc
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        if conns.aborted:
+            raise LLMCancelled("Stopped.") from exc
+        raise LLMError(f"Cannot reach {url}: {exc}") from exc
+    finally:
+        conns.remove(conn)
+        conn.close()
+
+
 def _with_retries(fn, retries: int):
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
             return fn()
+        except LLMCancelled:
+            raise
         except LLMError as exc:
             last = exc
             if "timed out" in str(exc):
@@ -100,6 +168,11 @@ class OllamaClient:
     keep_alive: str = "30m"
     name: str = "ollama"
     stats: CallStats = field(default_factory=CallStats, repr=False, compare=False)
+    _conns: _Connections = field(default_factory=_Connections, repr=False, compare=False)
+
+    def abort(self) -> None:
+        """Cut off any call in progress; later calls on this client fail at once (Stop button)."""
+        self._conns.abort()
 
     def chat(self, system: str, user: str, *, json_mode: bool = False,
              temperature: float | None = None, max_tokens: int | None = None) -> str:
@@ -118,7 +191,8 @@ class OllamaClient:
             payload["options"]["num_predict"] = max_tokens
         url = self.base_url.rstrip("/") + "/api/chat"
         t0 = time.monotonic()
-        data = _with_retries(lambda: _post_json(url, payload, {}, self.timeout), self.max_retries)
+        data = _with_retries(lambda: _post_json_local(url, payload, self.timeout, self._conns),
+                             self.max_retries)
         self.stats.add(data, time.monotonic() - t0)
         try:
             return data["message"]["content"]
@@ -142,6 +216,10 @@ class GeminiFreeTierClient:
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
         self._last_call = 0.0
+        self._aborted = False
+
+    def abort(self) -> None:
+        self._aborted = True
 
     def _throttle(self) -> None:
         # Stay within free-tier RPM limits so we never get pushed to billing.
@@ -167,6 +245,8 @@ class GeminiFreeTierClient:
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
         def call() -> dict[str, Any]:
+            if self._aborted:
+                raise LLMCancelled("Stopped.")
             self._throttle()
             return _post_json(url, payload, headers, self.timeout)
 

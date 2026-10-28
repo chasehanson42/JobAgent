@@ -112,14 +112,15 @@ def rank(settings: dict[str, Any], storage: Storage, client: LLMClient, *,
 def hunt(settings: dict[str, Any], storage: Storage, client: LLMClient | None, *,
          new_jobs: list[Job] | None = None, search: bool = True,
          on_progress: Callable[[Any], None] | None = None,
-         scoring_client: LLMClient | None = None):
+         scoring_client: LLMClient | None = None,
+         should_stop: Callable[[], bool] | None = None):
     """Search the job sites and score what fits, all in parallel. Returns a HuntSummary."""
     from core.agents import HuntPipeline
     from scrapers.job_scraper import build_queries
 
     queries = build_queries(settings.get("scrape", {})) if search else []
-    return HuntPipeline(settings, storage, client, scoring_client=scoring_client,
-                        on_progress=on_progress).run(queries, new_jobs or [])
+    return HuntPipeline(settings, storage, client, scoring_client=scoring_client, on_progress=on_progress,
+                        should_stop=should_stop or (lambda: False)).run(queries, new_jobs or [])
 
 
 def explain(settings: dict[str, Any], storage: Storage, client: LLMClient, job_id: str) -> FitResult:

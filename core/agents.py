@@ -64,6 +64,7 @@ class HuntProgress:
     explain_total: int = 0
     failed_queries: list[str] = field(default_factory=list)
     search_done: bool = False
+    stopped: bool = False      # the user pressed Stop; everything done so far is saved
 
     @property
     def fraction(self) -> float:
@@ -111,12 +112,14 @@ class HuntPipeline:
                  scoring_client: LLMClient | None = None,
                  query_fn: Callable[[SearchQuery], list[Job]] | None = None,
                  on_progress: Callable[[HuntProgress], None] | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 should_stop: Callable[[], bool] = lambda: False) -> None:
         self.settings = settings
         self.storage = storage
         self.query_fn = query_fn or (lambda q: job_scraper.run_query(q))
         self.on_progress = on_progress
         self.sleep = sleep
+        self.should_stop = should_stop
 
         par, rank = settings.get("parallel", {}), settings.get("ranking", {})
         self.search_workers = max(1, int(par.get("search_workers", 4)))
@@ -197,7 +200,8 @@ class HuntPipeline:
         for w in workers:
             w.join()
         self._finish()
-        if self._fatal is not None:
+        self.progress.stopped = self.should_stop()
+        if self._fatal is not None and not self.progress.stopped:
             raise self._fatal
         unscored = self._leftover + sum(1 for _, _, kind, _ in list(self._queue.queue) if kind == "score")
         speed = " · ".join(filter(None, (c.stats.summary() for c in self._distinct_clients()
@@ -209,12 +213,15 @@ class HuntPipeline:
 
     def _search_agent(self, queries: list[SearchQuery]) -> None:
         for i, q in enumerate(queries):
-            if self._fatal is not None:
+            if self._fatal is not None or self.should_stop():
                 return
             if i:
                 self.sleep(SAME_SITE_DELAY_SECONDS)
             try:
-                self._ingest(self.query_fn(q))
+                found = self.query_fn(q)
+                if self.should_stop():
+                    return
+                self._ingest(found)
             except Exception as exc:  # noqa: BLE001 - one failing site must not stop the hunt
                 log.warning("Search failed (%s): %s", q.label, exc)
                 with self._lock:
@@ -265,7 +272,7 @@ class HuntPipeline:
             self.progress.queued = self._queue.qsize()
 
     def _next_work(self) -> tuple[str, Job] | None:
-        while self._fatal is None:
+        while self._fatal is None and not self.should_stop():
             with self._lock:
                 try:
                     item = self._queue.get_nowait()
@@ -302,10 +309,12 @@ class HuntPipeline:
                 else:
                     result = self._explain(job)
             except LLMError as exc:
-                # The AI itself is unreachable or too slow: stop instead of
-                # filling the list with failed scores. The job stays unscored.
+                # Stop pressed (the call was cut off), or the AI is unreachable or too
+                # slow: end here instead of filling the list with failed scores. The
+                # job stays saved, unscored, for next time.
                 with self._lock:
-                    self._fatal = self._fatal or exc
+                    if not self.should_stop():
+                        self._fatal = self._fatal or exc
                     self.progress.scoring.remove(label)
                 return
             except Exception as exc:  # noqa: BLE001 - one odd reply must not stop the rest

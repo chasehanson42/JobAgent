@@ -172,7 +172,7 @@ def test_full_flow(app_env):
     _finish(_button(at, "Create resume & cover letter").click().run())
     assert not at.exception, at.exception
     labels = [d.label for d in at.get("download_button")]
-    assert labels[0] == "⬇️ Download resume + cover letter (PDF and Word)"      # one download for both
+    assert labels[0] == "Download resume + cover letter (PDF and Word)"      # one download for both
     assert labels.count("PDF") == 2 and labels.count("DOCX") == 2               # and separately
     import zipfile
     names = zipfile.ZipFile(next((tmp_path / "build").iterdir()) / "application.zip").namelist()
@@ -268,3 +268,38 @@ def test_search_and_rank_runs_in_one_step(app_env, monkeypatch):
     _finish(_button(at, "Search and rank").click().run())
     summary = next(s.value for s in at.success if "listings found" in s.value)
     assert "scored **0**" in summary                              # nothing old is re-scored
+
+
+def test_stop_button_ends_scoring_and_keeps_finished_work(app_env):
+    tmp_path, llm = app_env
+    release, calling = threading.Event(), threading.Event()
+    real_chat = llm.chat
+
+    def slow_chat(system, user, **kw):
+        calling.set()
+        release.wait(10)
+        return real_chat(system, user, **kw)
+
+    llm.chat = slow_chat
+    jobs = tmp_path / "data" / "jobs.jsonl"
+    jobs.parent.mkdir(parents=True)
+    jobs.write_text("".join(json.dumps({
+        "id": f"job{i}", "title": "Backend Engineer", "company": f"Co {i}", "location": "Austin, TX",
+        "description": "Python FastAPI PostgreSQL backend services for a growing team. " * 2}) + "\n"
+        for i in range(4)))
+
+    at = _page("ranked").run()
+    _button(at, "Score 4 job(s) with AI").click().run()
+    assert MANAGER.running() is not None
+    assert calling.wait(5)                                    # the AI is busy with a job
+    _button(at, "Stop").click().run()
+    assert MANAGER.running() is None                          # free to start something else now
+    release.set()
+    _finish(at)
+    assert not at.exception, at.exception
+    task = MANAGER.get("rank")
+    assert task.status == "stopped" and task.error is None
+    ranked = json.loads((tmp_path / "data" / "rankings.json").read_text())
+    assert 1 <= len(ranked) < 4                               # calls already running finished and were kept
+    assert any("haven't been scored yet" in m.value for m in at.markdown)
+    assert any(c.value == "Stopped." for c in at.caption)

@@ -6,6 +6,10 @@ it keeps going while the user clicks around; pages only read its progress.
 
 One task runs at a time: they all share the single local AI model, so
 running two would only make both slower.
+
+Any task can be stopped. Stopping sets a flag the task checks between steps
+and runs the task's stop hooks (e.g. cutting off an AI call in progress). A
+stopping task no longer blocks new ones, and keeps whatever it already saved.
 """
 from __future__ import annotations
 
@@ -27,17 +31,40 @@ class Task:
     key: str
     label: str
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    status: str = "running"            # running | done | error
+    status: str = "running"            # running | done | error | stopped
     progress: float | None = None      # 0..1, None = unknown
     message: str = ""
     result: Any = None
     error: BaseException | None = None
     started: float = field(default_factory=time.time)
     finished: float | None = None
+    _stop: threading.Event = field(default_factory=threading.Event, repr=False)
+    _hooks: list[Callable[[], Any]] = field(default_factory=list, repr=False)
 
     @property
     def running(self) -> bool:
         return self.status == "running"
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop.is_set()
+
+    def on_stop(self, hook: Callable[[], Any]) -> None:
+        """Run `hook` when the user presses Stop (immediately, if already stopped)."""
+        self._hooks.append(hook)
+        if self.stop_requested:
+            hook()
+
+    def request_stop(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        self.message = "Stopping..."
+        for hook in list(self._hooks):
+            try:
+                hook()
+            except Exception:  # noqa: BLE001 - stopping must never raise
+                pass
 
     def update(self, progress: float | None = None, message: str | None = None) -> None:
         if progress is not None:
@@ -63,10 +90,13 @@ class TaskManager:
         def run() -> None:
             try:
                 task.result = fn(task)
-                task.status = "done"
+                task.status = "stopped" if task.stop_requested else "done"
             except BaseException as exc:  # noqa: BLE001 - reported to the page
-                task.error = exc
-                task.status = "error"
+                if task.stop_requested:
+                    task.status = "stopped"     # the error is just the Stop cutting a call off
+                else:
+                    task.error = exc
+                    task.status = "error"
             finally:
                 task.finished = time.time()
 
@@ -77,7 +107,13 @@ class TaskManager:
         return self._tasks.get(key)
 
     def running(self) -> Task | None:
-        return next((t for t in self._tasks.values() if t.running), None)
+        """The task that blocks starting another one (a task being stopped doesn't)."""
+        return next((t for t in self._tasks.values() if t.running and not t.stop_requested), None)
+
+    def stop(self, key: str) -> None:
+        task = self._tasks.get(key)
+        if task is not None and task.running:
+            task.request_stop()
 
     def latest(self) -> Task | None:
         return max(self._tasks.values(), key=lambda t: t.started, default=None)
@@ -89,9 +125,9 @@ class TaskManager:
                 del self._tasks[key]
 
     def wait(self, timeout: float = 30) -> None:
-        """Block until nothing is running (used by tests)."""
+        """Block until no task thread is still working (used by tests)."""
         deadline = time.time() + timeout
-        while self.running() and time.time() < deadline:
+        while any(t.running for t in self._tasks.values()) and time.time() < deadline:
             time.sleep(0.02)
 
 

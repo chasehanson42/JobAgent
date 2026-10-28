@@ -98,6 +98,22 @@ def start_task(key: str, label: str, fn) -> None:
     st.rerun()
 
 
+def stoppable(task: Task, *clients):
+    """Let the Stop button cut off these clients' AI calls; returns the first client."""
+    for c in clients:
+        if c is not None and hasattr(c, "abort"):
+            task.on_stop(c.abort)
+    return clients[0] if clients else None
+
+
+def _stop_button(t: Task, where: str) -> None:
+    if t.stop_requested:
+        st.caption("Stopping... anything already finished is saved.")
+    elif st.button("Stop", key=f"stop_{where}_{t.id}", help="End this task now. Work already done is kept."):
+        MANAGER.stop(t.key)
+        st.rerun(scope="app")
+
+
 def busy_reason() -> str | None:
     t = MANAGER.running()
     return f"Waiting for “{t.label}” to finish" if t else None
@@ -125,8 +141,10 @@ def task_progress(key: str) -> None:
         return
     if t.running:
         st.progress(t.progress or 0.0, text=f"{t.message or t.label} · {_elapsed(t)}")
-        st.caption("You can keep using JobAgent while this runs. It stops only if you close "
-                   "the black JobAgent window.")
+        c1, c2 = st.columns([5, 1])
+        c1.caption("You can keep using JobAgent while this runs.")
+        with c2:
+            _stop_button(t, "inline")
     _refresh_when_finished(t)
 
 
@@ -137,19 +155,25 @@ def sidebar_status() -> None:
     if t is None:
         return
     if t.running:
-        st.info(f"⏳ **{t.label}**  \n{t.message or 'Working...'}")
+        st.info(f"**{t.label}**  \n{t.message or 'Working...'}")
         st.progress(t.progress or 0.0, text=_elapsed(t))
+        _stop_button(t, "sidebar")
     elif t.status == "done":
-        st.success(f"✅ Finished: {t.label}")
+        st.success(f"Finished: {t.label}")
+    elif t.status == "stopped":
+        st.info(f"Stopped: {t.label}")
     else:
         st.error(f"Couldn't finish: {t.label}")
     _refresh_when_finished(t)
 
 
 def task_error(key: str) -> None:
+    """Show how a finished task ended, if it didn't simply succeed."""
     t = MANAGER.get(key)
     if t is not None and t.status == "error":
         show_error(t.error)
+    elif t is not None and t.status == "stopped" and key != "hunt":
+        st.caption("Stopped.")
 
 
 # ---------------------------------------------------------------- setup
@@ -160,7 +184,7 @@ def page_setup() -> None:
     st.title("Welcome to JobAgent")
     if setup_complete(s):
         st.success("You're all set up.")
-        st.page_link(PAGES["ranked"], label="Go to your matches", icon="⭐")
+        st.page_link(PAGES["ranked"], label="Go to your matches")
     st.write("JobAgent finds jobs, tells you which ones fit you, and writes a matching resume "
              "and cover letter. Everything stays on your computer and it's free.")
 
@@ -216,12 +240,14 @@ def page_setup() -> None:
         st.success(f"Profile saved for **{load_profile(s).get('name') or 'you'}**.")
     else:
         st.info("Upload your current resume so JobAgent knows your experience.")
-    st.page_link(PAGES["profile"], label="Go to My profile", icon="👤")
+    st.page_link(PAGES["profile"], label="Go to My profile")
 
 
 def _pull(task: Task, base: str, model: str, role: str = "model") -> None:
     """Download a model; role "model" makes it the main model, "scoring_model" the quick-rating one."""
     for ev in ollama_admin.pull_model(base, model):
+        if task.stop_requested:
+            return  # Ollama keeps the part already downloaded and resumes next time
         done, total = ev.get("completed"), ev.get("total")
         if done and total:
             task.update(done / total, f"{ev['status']} · {done / 1e9:.1f} of {total / 1e9:.1f} GB")
@@ -299,7 +325,8 @@ def page_profile() -> None:
                 show_error(exc)
             else:
                 client = build_client(s)
-                start_task("resume", "Reading your resume", lambda t: _read_resume(t, client, text))
+                start_task("resume", "Reading your resume",
+                           lambda t: _read_resume(t, stoppable(t, client), text))
         task_error("resume")
 
     if st.session_state.import_warnings:
@@ -366,7 +393,7 @@ def page_profile() -> None:
             cur["experience"].append(e)
             if st.button("Remove this job", key=k(f"x{i}_remove")):
                 action = ("remove_job", i)
-    if st.button("➕ Add a job"):
+    if st.button("Add a job"):
         action = ("add_job", 0)
 
     st.subheader("Education")
@@ -376,9 +403,9 @@ def page_profile() -> None:
         cur["education"].append({"school": c1.text_input("School", ed["school"], key=k(f"e{i}_school")),
                                  "degree": c2.text_input("Degree", ed["degree"], key=k(f"e{i}_degree")),
                                  "year": c3.text_input("Year", str(ed["year"] or ""), key=k(f"e{i}_year"))})
-        if c4.button("✖", key=k(f"e{i}_remove"), help="Remove"):
+        if c4.button("Remove", key=k(f"e{i}_remove")):
             action = ("remove_edu", i)
-    if st.button("➕ Add education"):
+    if st.button("Add education"):
         action = ("add_edu", 0)
 
     cur["certifications"] = lines(st.text_area("Certifications and licenses, one per line",
@@ -410,7 +437,7 @@ def page_profile() -> None:
             st.rerun()
     if st.session_state.pop("saved_warnings", None) is not None:
         st.success("Profile saved.")
-        st.page_link(PAGES["find"], label="Next: find jobs", icon="🔎")
+        st.page_link(PAGES["find"], label="Next: find jobs")
 
 
 # ---------------------------------------------------------------- find jobs
@@ -429,7 +456,7 @@ def page_find() -> None:
     st.title("Find jobs")
     if not has_user_profile(s):
         st.warning("Add your profile first, so the filters and scoring are about you.")
-        st.page_link(PAGES["profile"], label="Go to My profile", icon="👤")
+        st.page_link(PAGES["profile"], label="Go to My profile")
 
     st.metric("Jobs saved so far", len(storage.load_jobs()))
 
@@ -496,7 +523,7 @@ def page_find() -> None:
         _hunt_status(search=False)
 
     if storage.load_jobs():
-        st.page_link(PAGES["ranked"], label="See your matches", icon="⭐")
+        st.page_link(PAGES["ranked"], label="See your matches")
     with st.expander("Start over"):
         if st.checkbox("Yes, delete all saved jobs and scores (your resumes in build/ are kept)"):
             if st.button("Delete saved jobs"):
@@ -508,9 +535,11 @@ def page_find() -> None:
 def _hunt(task: Task, settings: dict[str, Any], client, *, new_jobs=None, search: bool = True):
     scoring = build_client(settings, purpose="scoring")
     same = getattr(scoring, "model", None) == getattr(client, "model", None)
+    stoppable(task, client, None if same else scoring)
     return pipeline.hunt(settings, Storage(settings), client, new_jobs=new_jobs, search=search,
                          scoring_client=None if same else scoring,
-                         on_progress=lambda p: task.update(p.fraction, p.message))
+                         on_progress=lambda p: task.update(p.fraction, p.message),
+                         should_stop=lambda: task.stop_requested)
 
 
 def _hunt_status(search: bool) -> None:
@@ -520,8 +549,10 @@ def _hunt_status(search: bool) -> None:
         return
     if t.running:
         task_progress("hunt")
-    elif t.status == "done":
+    elif t.status in ("done", "stopped") and t.result is not None:
         _show_hunt_summary(t.result, t)
+    elif t.status == "stopped":
+        st.info("Stopped. Jobs found and scored before you pressed Stop are saved.")
     task_error("hunt")
 
 
@@ -547,6 +578,9 @@ def _reason_text(reason: str) -> str:
 
 def _show_hunt_summary(sm, task: Task) -> None:
     p = sm.progress
+    if p.stopped:
+        st.info("Stopped early. Jobs found and scored before you pressed Stop are saved; "
+                "unscored ones can be scored later on **Your matches**.")
     if p.queries_total and p.found == 0:
         st.warning("No jobs came back. Try broader titles, more locations, or more days.")
     else:
@@ -562,7 +596,7 @@ def _show_hunt_summary(sm, task: Task) -> None:
                       + (f", and explained the top {p.explained}." if p.explained else "."))
         st.success("  \n".join(lines_))
         if p.apply:
-            st.page_link(PAGES["ranked"], label="See your matches", icon="⭐")
+            st.page_link(PAGES["ranked"], label="See your matches")
     if sm.ai_speed:
         st.caption(f"AI speed on this computer: {sm.ai_speed}")
     if sm.unscored_left:
@@ -589,7 +623,7 @@ def page_ranked() -> None:
     total = len(storage.load_jobs())
     if total == 0:
         st.info("No jobs yet.")
-        st.page_link(PAGES["find"], label="Find jobs", icon="🔎")
+        st.page_link(PAGES["find"], label="Find jobs")
         return
 
     live = next((t for t in (MANAGER.get("hunt"), MANAGER.get("rank")) if t and t.running), None)
@@ -652,7 +686,7 @@ def _score_line(fit) -> str:
 
 def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
     with st.container(border=True):
-        c1, c2, c3 = st.columns([1, 5, 1.3])
+        c1, c2, c3 = st.columns([1, 4.2, 1.8])
         c1.metric("Fit", fit.fit_score)
         c2.markdown(f"**{_md(job.title)}**  \n{_md(job.company)} · {_md(job.location) or 'Location not listed'}")
         if job.url:
@@ -670,12 +704,12 @@ def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
         if fit.rationale:
             st.caption(_md(fit.rationale))
         if fit.fit_highlights:
-            st.markdown("**Why you fit**  \n" + "  \n".join(
-                f"✅ **{_md(h['requirement'])}**: {_md(h['evidence'])}" for h in fit.fit_highlights))
+            st.markdown("**Why you fit**\n\n" + "\n".join(
+                f"- **{_md(h['requirement'])}**: {_md(h['evidence'])}" for h in fit.fit_highlights))
         elif fit.matched_skills:
-            st.markdown("✅ **You have:** " + ", ".join(_md(x) for x in fit.matched_skills))
+            st.markdown("**You have:** " + ", ".join(_md(x) for x in fit.matched_skills))
         if fit.skill_gaps:
-            st.markdown("➖ **They also want:** " + ", ".join(_md(x) for x in fit.skill_gaps))
+            st.markdown("**They also want:** " + ", ".join(_md(x) for x in fit.skill_gaps))
 
         explain_key = f"explain:{job.id}"
         explaining = MANAGER.get(explain_key)
@@ -693,7 +727,7 @@ def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
                          disabled=bool(busy_reason()), help=busy_reason(), use_container_width=True):
                 client = build_client(s)
                 start_task(key, f"Writing documents for {job.title} at {job.company}", lambda t: pipeline.generate(
-                    s, storage, client, job.id, force=True,
+                    s, storage, stoppable(t, client), job.id, force=True,
                     progress=lambda i, n, what: t.update(None, f"Writing the {what} at the same time...")))
             if not fit.explained and not (explaining and explaining.running) and b2.button(
                     "Explain this match", key=f"explain_{job.id}", disabled=bool(busy_reason()),
@@ -701,7 +735,7 @@ def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
                     use_container_width=True):
                 client = build_client(s)
                 start_task(explain_key, f"Explaining {job.title} at {job.company}",
-                           lambda t: pipeline.explain(s, storage, client, job.id))
+                           lambda t: pipeline.explain(s, storage, stoppable(t, client), job.id))
         task_error(explain_key)
         task_error(key)
         if not (writing and writing.running):
@@ -715,7 +749,7 @@ def _downloads(out_dir: Path, job) -> None:
         return
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if bundle.exists():
-        st.download_button("⬇️ Download resume + cover letter (PDF and Word)", bundle.read_bytes(),
+        st.download_button("Download resume + cover letter (PDF and Word)", bundle.read_bytes(),
                            file_name=f"Application_{''.join(c for c in job.company if c.isalnum())[:30] or 'job'}.zip",
                            mime="application/zip", key=f"dl_{out_dir.name}_bundle", type="primary")
     with st.expander("Download one file at a time"):
@@ -732,7 +766,7 @@ def _downloads(out_dir: Path, job) -> None:
         rep = report.get(kind, {})
         problems = rep.get("hallucinations", []) + rep.get("issues", [])
         if problems:
-            with st.expander(f"⚠️ Please check the {label.lower()} before sending"):
+            with st.expander(f"Please check the {label.lower()} before sending"):
                 for p in problems:
                     st.write(f"- {p}")
 
@@ -745,8 +779,8 @@ PAGES: dict[str, Any] = {}
 def make_pages() -> list[Any]:
     """Create the st.Page objects (page_link needs them). Setup is the home page at "/"."""
     PAGES.clear()
-    PAGES["setup"] = st.Page(page_setup, title="Setup", icon="⚙️", default=True)
-    PAGES["profile"] = st.Page(page_profile, title="My profile", icon="👤", url_path="profile")
-    PAGES["find"] = st.Page(page_find, title="Find jobs", icon="🔎", url_path="find")
-    PAGES["ranked"] = st.Page(page_ranked, title="Your matches", icon="⭐", url_path="matches")
+    PAGES["setup"] = st.Page(page_setup, title="Setup", default=True)
+    PAGES["profile"] = st.Page(page_profile, title="My profile", url_path="profile")
+    PAGES["find"] = st.Page(page_find, title="Find jobs", url_path="find")
+    PAGES["ranked"] = st.Page(page_ranked, title="Your matches", url_path="matches")
     return list(PAGES.values())

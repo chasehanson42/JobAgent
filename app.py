@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import webapp  # noqa: E402
 
-st.set_page_config(page_title="JobAgent", page_icon="💼", layout="centered")
+st.set_page_config(page_title="JobAgent", layout="centered")
 nav = st.navigation(webapp.make_pages())
 with st.sidebar:
     webapp.sidebar_status()
