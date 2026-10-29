@@ -208,7 +208,10 @@ def test_existing_profile_round_trips_unchanged():
     profile, warnings = validate_profile(loaded)
     assert warnings == []
     assert loaded == original  # input not mutated
-    assert profile == _strip_strings(original)
+    expected = _strip_strings(original)
+    # Older profiles have no commute settings; they come back with the defaults.
+    expected["target"] = {"commute_miles": 25, "prefer_local": True, **expected["target"]}
+    assert profile == expected
 
 
 def test_validate_is_idempotent():
@@ -235,7 +238,7 @@ def test_validate_is_idempotent():
     assert once["name"] == "Ann"
     assert once["links"] == ["https://a.example", "https://b.example"]
     assert once["target"] == {"titles": ["Nurse", "Charge Nurse"], "min_salary": 85000,
-                              "remote_ok": False}
+                              "remote_ok": False, "commute_miles": 25, "prefer_local": True}
     assert once["skills"]["languages"] == ["Python"]
     assert once["skills"]["practices"] == ["Empathy", "Triage"]
     assert len(once["experience"]) == 1
@@ -253,3 +256,38 @@ def test_validate_warnings_for_missing_basics():
     assert "name" in joined and "email" in joined and "experience" in joined
     _, w2 = validate_profile(None)  # type: ignore[arg-type]
     assert len(w2) == 3
+
+
+# ---------------------------------------------------------------- commute settings
+def test_empty_profile_has_commute_defaults():
+    target = empty_profile()["target"]
+    assert target["commute_miles"] == 25
+    assert target["prefer_local"] is True
+
+
+@pytest.mark.parametrize("raw, miles", [
+    (None, 25), ("", 25), ("abc", 25), (True, 25), (float("nan"), 25),
+    (10, 10), (12.6, 13), ("40", 40), ("30 miles", 30), ("1,000", 500),
+    (0, 1), (-5, 1), (9999, 500), ("0.2", 1),
+])
+def test_commute_miles_coerced_and_clamped(raw, miles):
+    profile, _ = validate_profile({"target": {"commute_miles": raw}})
+    assert profile["target"]["commute_miles"] == miles
+    assert isinstance(profile["target"]["commute_miles"], int)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, True), (True, True), (False, False), ("no", False), ("yes", True), ("maybe", True),
+])
+def test_prefer_local_coerced(raw, expected):
+    profile, _ = validate_profile({"target": {"prefer_local": raw}})
+    assert profile["target"]["prefer_local"] is expected
+
+
+def test_commute_settings_kept_and_idempotent():
+    once, _ = validate_profile({"target": {"titles": ["Clerk"], "commute_miles": "15",
+                                           "prefer_local": "off", "unknown": 1}})
+    assert once["target"] == {"titles": ["Clerk"], "min_salary": None, "remote_ok": True,
+                              "commute_miles": 15, "prefer_local": False}
+    twice, _ = validate_profile(copy.deepcopy(once))
+    assert twice == once

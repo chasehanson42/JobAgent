@@ -169,6 +169,9 @@ class HuntPipeline:
         t0 = time.time()
         queries = list(queries)
         self.progress.queries_total = len(queries)
+        if self.evaluator:
+            # Distance scoring needs the town index; start loading it while the search runs.
+            threading.Thread(target=_warm_location_index, name="warm-places", daemon=True).start()
 
         if score_stored and self.evaluator:
             stored = self.storage.load_jobs()
@@ -413,3 +416,11 @@ def merge_explanation(current: FitResult | None, detail: FitResult) -> FitResult
     return replace(current, fit_highlights=detail.fit_highlights, matched_skills=detail.matched_skills,
                    skill_gaps=detail.skill_gaps or current.skill_gaps, rationale=detail.rationale,
                    explained=True)
+
+
+def _warm_location_index() -> None:
+    try:
+        from matching.location import load_index
+        load_index()
+    except Exception:  # noqa: BLE001 - scoring falls back to plain town-name matching
+        pass

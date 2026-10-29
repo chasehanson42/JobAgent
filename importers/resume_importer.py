@@ -61,7 +61,8 @@ def empty_profile() -> dict[str, Any]:
         "links": [],
         "headline": "",
         "summary": "",
-        "target": {"titles": [], "min_salary": None, "remote_ok": True},
+        "target": {"titles": [], "min_salary": None, "remote_ok": True,
+                   "commute_miles": DEFAULT_COMMUTE_MILES, "prefer_local": True},
         "skills": {bucket: [] for bucket in SKILL_BUCKETS},
         "experience": [],
         "education": [],
@@ -229,6 +230,25 @@ def _min_salary(value: Any) -> int | None:
     return int(amount) if amount > 0 else None
 
 
+DEFAULT_COMMUTE_MILES = 25
+
+
+def _commute_miles(value: Any) -> int:
+    """How far the person will travel to work, as whole miles from 1 to 500."""
+    if isinstance(value, bool) or value is None:
+        return DEFAULT_COMMUTE_MILES
+    if isinstance(value, (int, float)):
+        miles = value
+    else:
+        m = re.search(r"\d+(?:\.\d+)?", _str(value).replace(",", ""))
+        if not m:
+            return DEFAULT_COMMUTE_MILES
+        miles = float(m.group(0))
+    if miles != miles or miles in (float("inf"), float("-inf")):  # NaN / inf
+        return DEFAULT_COMMUTE_MILES
+    return max(1, min(500, int(round(miles))))
+
+
 def _bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -290,6 +310,8 @@ def validate_profile(data: dict) -> tuple[dict, list[str]]:
         "titles": _dedupe(_str_list(target.get("titles"), split=r"[,;\n]")),
         "min_salary": _min_salary(target.get("min_salary")),
         "remote_ok": _bool(target.get("remote_ok"), True),
+        "commute_miles": _commute_miles(target.get("commute_miles")),
+        "prefer_local": _bool(target.get("prefer_local"), True),
     }
 
     skills_src = src.get("skills")

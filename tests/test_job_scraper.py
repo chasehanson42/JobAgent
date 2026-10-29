@@ -50,6 +50,17 @@ def test_row_to_job_full_mapping():
     assert job.date_posted == "2026-10-01"
     assert job.scraped_at == "2026-10-20T00:00:00+00:00"
     assert job.sanitizer_flags == []
+    assert job.company_employees is None  # column absent
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("11 to 50", "11 to 50"), ("  10,000+ ", "10,000+"), (NAN, None), (None, None),
+    ("", None), (250, "250"),
+])
+def test_row_to_job_company_employees(raw, expected):
+    job = _row_to_job(_row(company_num_employees=raw))
+    assert job is not None
+    assert job.company_employees == expected
 
 
 def test_row_to_job_nan_values_become_none():

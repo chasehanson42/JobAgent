@@ -30,6 +30,22 @@ def _record_server() -> None:
 
 _record_server()
 
+
+def _preload_places() -> None:
+    """Load the town index for distance-from-home scoring in the background, once per
+    server start, so the first scored job doesn't wait for it (first run ~7s, then <1s)."""
+    def load() -> None:
+        try:
+            from matching.location import load_index
+            load_index()
+        except Exception:  # noqa: BLE001 - scoring falls back to plain town-name matching
+            pass
+    import threading
+    threading.Thread(target=load, name="preload-places", daemon=True).start()
+
+
+_preload_places()
+
 MODEL_SIZES = {"qwen2.5:7b-instruct": "4.7 GB", "qwen2.5:3b-instruct": "1.9 GB"}
 JOB_SITES = ["indeed", "linkedin", "glassdoor", "zip_recruiter", "google"]
 DOC_LABELS = {"resume": "Resume", "cover_letter": "Cover letter"}

@@ -161,6 +161,7 @@ def _row_to_job(row: dict[str, Any], scraped_at: str | None = None) -> Job | Non
         salary_currency=_opt_str(row.get("currency")),
         salary_interval=_enum_str(row.get("interval")),
         date_posted=_date(row.get("date_posted")),
+        company_employees=_opt_str(row.get("company_num_employees")),
         scraped_at=scraped_at or _now_iso(),
     )
 
