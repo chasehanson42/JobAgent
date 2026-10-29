@@ -169,7 +169,7 @@ def test_full_flow(app_env):
     why = next(m.value for m in at.markdown if "Why you fit" in m.value)   # top match auto-explained
     assert "Patient scheduling" in why and "Bluebird Dental" in why
     assert "500 clinics" not in why                               # invented evidence dropped
-    _finish(_button(at, "Create resume & cover letter").click().run())
+    _finish(_button(at, "Resume + cover letter").click().run())
     assert not at.exception, at.exception
     labels = [d.label for d in at.get("download_button")]
     assert labels[0] == "Download resume + cover letter (PDF and Word)"      # one download for both

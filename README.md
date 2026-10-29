@@ -14,7 +14,8 @@ tailored ATS resume and cover letter grounded only in your own profile.
 4. Follow the **Setup** page: download the AI model, upload your resume, check it, save.
 5. **Find jobs** → **Search and rank** (or paste a posting). Matches appear on
    **Your matches** as they're scored, best first, with a score breakdown →
-   **Create resume & cover letter** → one download with both, as PDF and Word.
+   **Resume + cover letter** (or either one) → download as PDF and Word.
+6. Optional: on **Templates**, paste in your own resume layout and cover letter.
 
 Keep the black launcher window open while you use JobAgent; close it to stop.
 On a Mac, the first time macOS may refuse to open the file: right-click it → **Open** → **Open**.
@@ -61,8 +62,11 @@ free_job_agent/
 │   ├── location.py            # offline distance from home (towns of 500+ people)
 │   └── fit_evaluator.py       # LLM scoring -> fit_score, matched_skills, gaps, rec
 ├── generators/
-│   ├── resume_tailor.py       # rewrites bullets from verified profile facts only
-│   ├── cover_letter_writer.py # 3-paragraph letter
+│   ├── templates.py           # editable resume / cover letter templates
+│   ├── relevance.py           # picks relevant jobs, bullets and skills (no AI)
+│   ├── _editing.py            # small parallel AI edits with a shared, cacheable prefix
+│   ├── resume_tailor.py       # fills the resume template
+│   ├── cover_letter_writer.py # fills the cover letter template
 │   └── critic_agent.py        # deterministic + LLM hallucination/format checks
 ├── importers/
 │   └── resume_importer.py     # PDF/DOCX/TXT resume -> draft profile (+ what to double-check)
@@ -150,8 +154,22 @@ or lower is never recommended, however close it is.
   only runs them together if `OLLAMA_NUM_PARALLEL` allows it. The launchers set
   it when *they* start Ollama, so quit Ollama from the tray first. On a CPU
   without a graphics card this helps less.
-- **Documents**: the resume and cover letter are written at the same time, with
-  one AI review each. You download both as one zip, in PDF and Word.
+- **Documents** start from templates you can edit on the **Templates** page
+  (`generators/templates.py` has the defaults; your versions are saved in the
+  git-ignored `config/my_templates/`). Fields like `{company}`, `{job_title}`
+  and `{date}` are filled in by code. The AI only tailors the resume summary,
+  the bullets of your most relevant jobs, and each cover letter paragraph. Each
+  of those is its own short AI call, and the calls run side by side. A paragraph
+  starting with `KEEP:` is used as written; `[notes]` tell the AI what to write.
+- **Relevance filtering** (`generators/relevance.py`): which jobs get bullet
+  points, which bullets, and which skills are chosen without the AI by matching
+  against the posting. Unrelated jobs shrink to one line (title, employer,
+  dates), and their details never reach the AI.
+- **Fact checks**: a rewritten bullet, summary or paragraph that adds numbers,
+  employers or claims not in your profile (or your template) is replaced by the
+  original text. A slower AI proofread is available with `generation.llm_review`.
+- Make the resume, the cover letter, or both; download them as one zip
+  (PDF and Word) or one file at a time.
 
 CLI equivalent: `python orchestrator.py hunt`.
 

@@ -9,3 +9,4 @@ __pycache__/
 config/user_settings.yaml
 config/my_profile.yaml
 .venv/
+config/my_templates/

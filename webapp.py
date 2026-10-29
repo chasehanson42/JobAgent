@@ -721,15 +721,20 @@ def _job_card(s: dict[str, Any], storage: Storage, fit, job) -> None:
         if writing and writing.running:
             task_progress(key)
         else:
-            b1, b2 = st.columns(2)
-            label = "Create again" if (out_dir / "application.zip").exists() else "Create resume & cover letter"
-            if b1.button(label, key=f"gen_{job.id}", type="primary" if fit.recommendation == "Apply" else "secondary",
-                         disabled=bool(busy_reason()), help=busy_reason(), use_container_width=True):
-                client = build_client(s)
-                start_task(key, f"Writing documents for {job.title} at {job.company}", lambda t: pipeline.generate(
-                    s, storage, stoppable(t, client), job.id, force=True,
-                    progress=lambda i, n, what: t.update(None, f"Writing the {what} at the same time...")))
-            if not fit.explained and not (explaining and explaining.running) and b2.button(
+            b1, b2, b3, b4 = st.columns([1.5, 1, 1, 1.1])
+            choices = [(b1, "Resume + cover letter", ("resume", "cover_letter")),
+                       (b2, "Resume only", ("resume",)), (b3, "Cover letter only", ("cover_letter",))]
+            for col, label, kinds in choices:
+                if col.button(label, key=f"gen_{'_'.join(kinds)}_{job.id}", use_container_width=True,
+                              type="primary" if len(kinds) == 2 and fit.recommendation == "Apply" else "secondary",
+                              disabled=bool(busy_reason()), help=busy_reason()):
+                    client = build_client(s)
+                    what = " and ".join(DOC_LABELS[k].lower() for k in kinds)
+                    start_task(key, f"Writing the {what} for {job.title} at {job.company}",
+                               lambda t, kinds=kinds, what=what: pipeline.generate(
+                                   s, storage, stoppable(t, client), job.id, force=True, kinds=kinds,
+                                   progress=lambda i, n, _: t.update(None, f"Writing the {what}...")))
+            if not fit.explained and not (explaining and explaining.running) and b4.button(
                     "Explain this match", key=f"explain_{job.id}", disabled=bool(busy_reason()),
                     help=busy_reason() or "Have the AI write out why you fit (about a minute)",
                     use_container_width=True):
@@ -748,8 +753,9 @@ def _downloads(out_dir: Path, job) -> None:
     if not report_path.exists():
         return
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    if bundle.exists():
-        st.download_button("Download resume + cover letter (PDF and Word)", bundle.read_bytes(),
+    have = [label for kind, label in DOC_LABELS.items() if (out_dir / f"{kind}.pdf").exists()]
+    if bundle.exists() and have:
+        st.download_button(f"Download {' + '.join(h.lower() for h in have)} (PDF and Word)", bundle.read_bytes(),
                            file_name=f"Application_{''.join(c for c in job.company if c.isalnum())[:30] or 'job'}.zip",
                            mime="application/zip", key=f"dl_{out_dir.name}_bundle", type="primary")
     with st.expander("Download one file at a time"):
@@ -771,6 +777,68 @@ def _downloads(out_dir: Path, job) -> None:
                     st.write(f"- {p}")
 
 
+# ---------------------------------------------------------------- templates
+
+def page_templates() -> None:
+    from generators import templates
+
+    s = load_settings()
+    st.title("Templates")
+    st.write("Your resume and cover letter start from these templates. JobAgent fills in the "
+             "{fields} with your details and the job's, and the AI tailors only the parts listed "
+             "below. Everything else stays exactly as you write it.")
+    tab_cl, tab_resume = st.tabs(["Cover letter", "Resume"])
+
+    with tab_cl:
+        st.markdown(
+            "- Each body paragraph is tailored to the job: the AI swaps in the company, the role and "
+            "your most relevant skills and experience, in your own voice.\n"
+            "- Text in **[square brackets]** tells the AI what to write there, for example "
+            "*[Describe my experience with patient scheduling]*.\n"
+            "- Start a paragraph with **KEEP:** to use it exactly as written (just the fields filled in).\n"
+            "- The greeting, date, address lines and everything from *Sincerely* on are never changed.")
+        _template_editor("cover_letter", templates.COVER_LETTER_FIELDS)
+
+    with tab_resume:
+        st.markdown(
+            "- The AI rewrites the **{summary}** and the bullet points of your most relevant jobs "
+            "inside **{experience}**. Everything else comes from your profile as is.\n"
+            "- Jobs unrelated to the posting are shown as one line (title, employer, dates) so there "
+            "are no gaps, but their bullet points are left out.\n"
+            "- Rename, reorder or remove sections, or add your own text (volunteering, languages).")
+        _template_editor("resume", templates.RESUME_FIELDS)
+        cfg = (s.get("generation") or {}).get("resume") or {}
+        st.subheader("How much to include")
+        c1, c2, c3 = st.columns(3)
+        detailed = c1.number_input("Jobs shown with bullet points", 1, 10, int(cfg.get("detailed_jobs", 3)))
+        bullets = c2.number_input("Bullet points per job", 1, 8, int(cfg.get("bullets_per_job", 3)))
+        skills = c3.number_input("Skills listed", 3, 30, int(cfg.get("max_skills", 10)))
+        if st.button("Save these numbers"):
+            save_user_overrides({"generation": {"resume": {"detailed_jobs": int(detailed),
+                                                           "bullets_per_job": int(bullets),
+                                                           "max_skills": int(skills)}}})
+            st.success("Saved.")
+
+
+def _template_editor(kind: str, fields: dict[str, str]) -> None:
+    from generators import templates
+
+    with st.expander("Fields you can use"):
+        st.markdown("\n".join(f"- `{{{k}}}`: {v}" for k, v in fields.items()))
+    version = st.session_state.get(f"tpl_ver_{kind}", 0)
+    text = st.text_area("Template", templates.load_template(kind), height=420, key=f"tpl_{kind}_{version}")
+    c1, c2, _ = st.columns([1, 1, 3])
+    if c1.button("Save template", key=f"save_{kind}", type="primary"):
+        warnings = templates.save_template(kind, text)
+        st.success("Saved. New documents will use it.")
+        for w in warnings:
+            st.warning(w)
+    if templates.is_custom(kind) and c2.button("Back to the default", key=f"reset_{kind}"):
+        templates.reset_template(kind)
+        st.session_state[f"tpl_ver_{kind}"] = version + 1
+        st.rerun()
+
+
 # ---------------------------------------------------------------- navigation
 
 PAGES: dict[str, Any] = {}
@@ -783,4 +851,5 @@ def make_pages() -> list[Any]:
     PAGES["profile"] = st.Page(page_profile, title="My profile", url_path="profile")
     PAGES["find"] = st.Page(page_find, title="Find jobs", url_path="find")
     PAGES["ranked"] = st.Page(page_ranked, title="Your matches", url_path="matches")
+    PAGES["templates"] = st.Page(page_templates, title="Templates", url_path="templates")
     return list(PAGES.values())

@@ -305,8 +305,8 @@ def test_resume_and_cover_letter_are_written_at_the_same_time(env):
 
     t0 = time.time()
     result = pipeline.generate(settings, storage, DocLLM(), target.id, force=True)
-    assert state["max"] == 2                       # both documents in flight together
-    assert state["calls"] <= 4                     # draft + one review each, no extra rounds
+    assert state["max"] >= 2                       # both documents' small edits in flight together
+    assert state["calls"] <= 6                     # summary + up to 3 jobs + 2 paragraphs; no AI review
     assert time.time() - t0 < 4 * 0.2 * 2   # loose: concurrency itself is checked above
     assert result.bundle and result.bundle.exists()
 

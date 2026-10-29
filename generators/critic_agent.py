@@ -127,18 +127,20 @@ class CriticAgent:
         if kind == "resume":
             if not re.search(r"^#\s+\S", doc, re.MULTILINE):
                 issues.append("Missing '# Name' heading")
-            required = list(RESUME_SECTIONS)
-            if not self.profile.get("certifications"):
-                required.remove("Certifications")
-            if not self.profile.get("education"):
-                required.remove("Education")
-            for sec in required:
-                if not re.search(rf"^##\s+{sec}\b", doc, re.MULTILINE | re.IGNORECASE):
-                    issues.append(f"Missing required section: ## {sec}")
+            # Users choose their own sections in the template; just make sure there are some
+            # and that every job from the profile is listed.
+            if not re.search(r"^##\s+\S", doc, re.MULTILINE):
+                issues.append("The resume has no section headings")
+            for exp in self.profile.get("experience") or []:
+                company = str(exp.get("company", "")).strip()
+                if company and company.lower() not in doc.lower():
+                    issues.append(f"Job at {company} is missing from the resume")
         else:
             body = self._cover_letter_body(doc)
-            if len(body) != 3:
-                issues.append(f"Cover letter must have exactly 3 body paragraphs (found {len(body)})")
+            if not body:
+                issues.append("The cover letter has no body paragraphs")
+            elif len(body) > 6:
+                issues.append(f"The cover letter has {len(body)} paragraphs; 3 to 5 reads better")
             words = sum(len(p.split()) for p in body)
             if words > COVER_LETTER_MAX_WORDS:
                 issues.append(f"Cover letter body is {words} words (max {COVER_LETTER_MAX_WORDS})")

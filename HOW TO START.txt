@@ -30,8 +30,10 @@ EVERY TIME YOU USE IT
      Setup        - download the AI model (one time)
      My profile   - upload your resume, check what it filled in, click Save
      Find jobs    - search job sites, or paste a job you found
-     Your matches - score the jobs, then "Create resume & cover letter"
-                    and download the PDF or Word file
+     Your matches - your best matches, scored. Click "Resume + cover letter"
+                    (or just one of them) and download the PDF or Word file
+     Templates    - optional: paste in your own cover letter and resume
+                    layout; JobAgent tailors them to each job
 
 GOOD TO KNOW
 ------------

@@ -72,9 +72,16 @@ parallel:
                                        # they start Ollama. Extra workers just wait otherwise.
 
 generation:
-  critic_max_rounds: 1                 # one AI review + fix per document
-  recheck_with_llm: false              # re-check fixes with instant checks only (saves an AI call)
+  # Documents are filled from templates (edit them on the Templates page). The AI makes
+  # small edits side by side; each is checked instantly for invented facts.
   parallel: true                       # write resume and cover letter at the same time
+  llm_review: false                    # extra slow AI proofread of each document
+  critic_max_rounds: 1                 # only used when llm_review is on
+  resume:
+    detailed_jobs: 3                   # jobs shown with bullet points (most relevant + most recent)
+    bullets_per_job: 3                 # most relevant bullets kept per detailed job
+    min_bullets: 2                     # never fewer than this for a detailed job
+    max_skills: 10                     # skills the job asks for come first
   export_formats: [md, pdf, docx]
 
 paths:

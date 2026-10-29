@@ -177,10 +177,20 @@ class GenerateResult:
         return all(r["passed"] for r in self.reports.values())
 
 
+DOCUMENT_KINDS = ("resume", "cover_letter")
+
+
 def generate(settings: dict[str, Any], storage: Storage, client: LLMClient, job_id: str, *,
-             force: bool = False, progress: Progress | None = None) -> GenerateResult:
-    """Tailored resume + cover letter, critic loop, export to build/<job_id>/."""
+             force: bool = False, progress: Progress | None = None,
+             kinds: tuple[str, ...] = DOCUMENT_KINDS) -> GenerateResult:
+    """Fill the resume and/or cover letter templates for one job; export to build/<job_id>/.
+
+    Each document is a handful of small AI edits run side by side (see
+    generators._editing), checked instantly for invented facts. The slow AI
+    review is optional (generation.llm_review).
+    """
     from exporters.pdf_builder import export_documents
+    from generators._editing import build_context
     from generators.cover_letter_writer import CoverLetterWriter
     from generators.critic_agent import CriticAgent
     from generators.resume_tailor import ResumeTailor
@@ -191,27 +201,37 @@ def generate(settings: dict[str, Any], storage: Storage, client: LLMClient, job_
     fit = next((r for r in storage.load_rankings() if r.job_id == job.id), None)
     if fit and fit.recommendation == "Skip" and not force:
         raise PipelineError(f"This job scored {fit.fit_score} (Skip). Generate anyway with force.")
+    kinds = tuple(k for k in DOCUMENT_KINDS if k in kinds)
 
     gen_cfg = settings.get("generation", {})
+    llm_review = bool(gen_cfg.get("llm_review", False))
     rounds = int(gen_cfg.get("critic_max_rounds", 1))
-    recheck = bool(gen_cfg.get("recheck_with_llm", False))
     formats = list(gen_cfg.get("export_formats", ["md", "pdf", "docx"]))
     profile = load_profile(settings)
     critic = CriticAgent(client, profile)
     out_dir = storage.job_build_dir(job.id)
     result = GenerateResult(job, out_dir, [])
+    # One context for both documents: the same job excerpt and fact sheet open every
+    # AI call, so Ollama can reuse what it has already read.
+    ctx = build_context(profile, job, fit, settings)
 
     def write(kind: str) -> tuple[str, Any]:
-        draft = (ResumeTailor(client, profile).tailor(job, fit) if kind == "resume"
-                 else CoverLetterWriter(client, profile).write(job, fit))
-        return critic.refine(draft, job, kind, max_rounds=rounds, recheck_with_llm=recheck)
+        draft = (ResumeTailor(client, profile, settings).tailor(job, fit, ctx) if kind == "resume"
+                 else CoverLetterWriter(client, profile, settings).write(job, fit, ctx=ctx))
+        if llm_review:
+            return critic.refine(draft, job, kind, max_rounds=rounds, recheck_with_llm=False)
+        return draft, critic.deterministic_checks(draft, kind)
 
-    # Resume and cover letter are independent: write them at the same time.
     if progress:
-        progress(1, 2, "resume and cover letter")
-    kinds = ("resume", "cover_letter")
-    with ThreadPoolExecutor(max_workers=2 if gen_cfg.get("parallel", True) else 1) as pool:
+        progress(1, 2, " and ".join(k.replace("_", " ") for k in kinds))
+    with ThreadPoolExecutor(max_workers=len(kinds) if gen_cfg.get("parallel", True) else 1) as pool:
         outcomes = dict(zip(kinds, pool.map(write, kinds)))
+
+    reports_path = out_dir / "critic_report.json"
+    try:
+        result.reports = json.loads(reports_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        result.reports = {}
     for kind in kinds:
         final, report = outcomes[kind]
         result.reports[kind] = {"passed": report.passed, "issues": report.issues,
@@ -219,7 +239,7 @@ def generate(settings: dict[str, Any], storage: Storage, client: LLMClient, job_
         result.files += export_documents(final, out_dir / kind, formats)
     result.bundle = bundle_application(out_dir, profile.get("name", ""), job.company)
 
-    (out_dir / "critic_report.json").write_text(json.dumps(result.reports, indent=2), encoding="utf-8")
+    reports_path.write_text(json.dumps(result.reports, indent=2), encoding="utf-8")
     (out_dir / "job.json").write_text(json.dumps(job.to_dict(), indent=2, ensure_ascii=False),
                                       encoding="utf-8")
     return result
